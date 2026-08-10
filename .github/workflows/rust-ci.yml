@@ -5,6 +5,9 @@ on:
     branches: ["rewrite"]
   pull_request:
     branches: ["rewrite"]
+  # Lets the workflow be started from the Actions tab, which is the only way to
+  # kick off a first run on a fork after enabling Actions.
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
