@@ -88,6 +88,37 @@ After these steps, you can use Bonelab Mod Manager like normal.
 1. Unsubscribe to the mod on [mod.io](https://mod.io/g/bonelab).
 2. Launch Bonelab Mod Manager and it will remove the mod.
 
+### Sign Out
+
+Launch the program with `--sign-out` to forget your saved mod.io token:
+
+```sh
+bonelab_mod_manager --sign-out
+```
+
+The next launch will ask how you would like to sign in again, so this is also
+how you switch mod.io accounts. Your installed mods and your platform choice
+are kept.
+
+If you launch the program by double clicking it, make a shortcut to the
+executable and add ` --sign-out` to the end of the shortcut's Target field.
+
+### Where Your Sign In Is Stored
+
+| Platform | Location |
+| --- | --- |
+| Windows | `%AppData%\bonelab_mod_manager\app_data`, in plain text |
+| macOS | Keychain, under `bonelab_mod_manager` |
+| Linux | Secret Service (GNOME Keyring or KWallet), under `bonelab_mod_manager` |
+
+Windows does not use Credential Manager for this. A mod.io token is around 1800
+characters, and Credential Manager refuses anything over 2560 bytes once the
+value is encoded as UTF-16.
+
+That matters most if you play on Quest, because the staging folder you copy mods
+from, `%AppData%\bonelab_mod_manager\Mods`, sits right next to that file. Copy
+the `Mods` folder to your headset, not the folder containing it.
+
 ## Mod Installation Paths
 
 PC mods are installed directly into your Bonelab installation, at

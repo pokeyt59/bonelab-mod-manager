@@ -52,6 +52,11 @@ fn builder(target_platform: TargetPlatform) -> Result<Builder> {
         .target_platform(target_platform))
 }
 
+// Windows deliberately does not use the credential store. A mod.io token is
+// around 1800 characters, and Windows Credential Manager caps a credential at
+// 2560 bytes once the value is encoded as UTF-16, so storing one there fails
+// outright. See `keyring_cannot_hold_a_modio_token_on_windows`.
+
 #[cfg(target_family = "unix")]
 fn entry() -> Result<Entry> {
     Ok(Entry::new("bonelab_mod_manager", &env::var("USER")?)?)
@@ -87,7 +92,11 @@ async fn set_password(password: &str) -> Result<()> {
 
 #[cfg(target_family = "unix")]
 pub(super) async fn delete_password() -> Result<()> {
-    Ok(entry()?.delete_credential()?)
+    // Not having an entry to remove is the state we were after anyway, so
+    // signing out twice is not an error.
+    let _ = entry()?.delete_credential();
+
+    Ok(())
 }
 
 #[cfg(target_os = "windows")]
@@ -166,4 +175,39 @@ pub(super) async fn authenticate(target_platform: TargetPlatform) -> Result<Clie
     debug!("set password");
 
     Ok(client.with_token(token))
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod tests {
+    use keyring::Entry;
+
+    /// Documents why Windows keeps the token in the app data file rather than
+    /// the credential store, so nobody "fixes" it back.
+    ///
+    /// Ignored by default because it writes to the real credential store, which
+    /// cannot be pointed somewhere harmless.
+    #[test]
+    #[ignore = "writes to the real Windows credential store"]
+    fn keyring_cannot_hold_a_modio_token_on_windows() {
+        // Roughly what mod.io issues.
+        const TOKEN_LEN: usize = 1822;
+
+        let entry = Entry::new("bonelab_mod_manager_probe", "probe").unwrap();
+
+        assert!(
+            entry.set_password(&"a".repeat(512)).is_ok(),
+            "a short secret should store fine",
+        );
+
+        let err = entry
+            .set_password(&"a".repeat(TOKEN_LEN))
+            .expect_err("Credential Manager took a token sized secret; revisit using it");
+
+        assert!(
+            err.to_string().contains("longer than the platform limit"),
+            "unexpected failure storing a token sized secret: {err}",
+        );
+
+        let _ = entry.delete_credential();
+    }
 }

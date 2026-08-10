@@ -12,12 +12,16 @@ use console::Style;
 use indicatif::{style::TemplateError, ProgressBar, ProgressStyle};
 use log::debug;
 use modio::{
-    types::{id::ModId, mods::Mod, TargetPlatform},
+    types::{
+        id::{FileId, ModId},
+        mods::Mod,
+        TargetPlatform,
+    },
     util::download::{Download, DownloadAction},
     Client,
 };
 use tokio::{
-    fs::{remove_dir_all, remove_file, symlink_metadata},
+    fs::{remove_dir_all, remove_file, symlink_metadata, try_exists},
     task::spawn_blocking,
 };
 use zip::{read::root_dir_common_filter, ZipArchive};
@@ -217,6 +221,22 @@ pub(crate) async fn remove_installed_mod(
     Ok(())
 }
 
+/// Picks the mod file built for `target_platform`.
+///
+/// Mods are published per platform and the builds genuinely differ, so handing
+/// a Quest user the Windows file would give them something Bonelab cannot load.
+/// `modfile` is only a fallback: the client sends a target platform header, so
+/// mod.io has already resolved that field for this platform.
+fn file_id_for(r#mod: &Mod, target_platform: TargetPlatform) -> Result<FileId> {
+    r#mod
+        .platforms
+        .iter()
+        .find(|platform| platform.target == target_platform)
+        .map(|platform| platform.modfile_id)
+        .or_else(|| r#mod.modfile.as_ref().map(|modfile| modfile.id))
+        .ok_or(anyhow!("Mod does not have a {target_platform} mod file"))
+}
+
 pub(crate) async fn install_mod(
     r#mod: Mod,
     progress_bar: ProgressBar,
@@ -275,29 +295,25 @@ async fn _install_mod(
 
     let updating = match &installed_mod {
         Some(installed_mod) => {
-            debug!("mod is already installed");
+            debug!("mod has an installation on record");
 
-            if installed_mod.date_updated >= date_updated {
+            // The record is only a cache of what is on disk, so a mod that has
+            // since been deleted by hand needs laying down again however recent
+            // the record claims it is.
+            let present = try_exists(mods_dir.join(&installed_mod.folder)).await?;
+
+            if present && installed_mod.date_updated >= date_updated {
                 return Ok(ModInstallationOutcome::AlreadyInstalled);
             }
 
-            debug!("mod needs to be updated");
+            debug!("mod needs to be installed again");
 
-            true
+            present
         }
         None => false,
     };
 
-    // Prefer the file mod.io lists for our platform. `modfile` is the fallback
-    // because the client sends a target platform header, so mod.io has already
-    // resolved it for this platform.
-    let file_id = r#mod
-        .platforms
-        .iter()
-        .find(|platform| platform.target == target_platform)
-        .map(|platform| platform.modfile_id)
-        .or_else(|| r#mod.modfile.as_ref().map(|modfile| modfile.id))
-        .ok_or(anyhow!("Mod does not have a {target_platform} mod file"))?;
+    let file_id = file_id_for(&r#mod, target_platform)?;
 
     debug!("got mod file id");
 
@@ -357,10 +373,11 @@ async fn _install_mod(
 
 /// Unpacks a mod archive into `mods_dir` and reports the folder it created.
 ///
-/// Bonelab loads a mod from a single `Author.ModName` directory holding an
-/// `Author.ModName.pallet.json`, so an archive without exactly one root
-/// directory would scatter its contents across the Mods folder. Rejecting it
-/// before extracting leaves the Mods folder untouched.
+/// Bonelab loads a mod from a single `Author.ModName` directory holding a
+/// pallet manifest, named either `pallet.json` or after the mod itself, so an
+/// archive without exactly one root directory would scatter its contents across
+/// the Mods folder. Rejecting it before extracting leaves the Mods folder
+/// untouched.
 fn extract_mod(bytes: Vec<u8>, mods_dir: &Path) -> Result<OsString> {
     let mut archive = ZipArchive::new(Cursor::new(bytes))?;
     let root_dir = archive.root_dir(root_dir_common_filter)?.ok_or(anyhow!(
@@ -390,8 +407,8 @@ mod tests {
     use crate::BONELAB_GAME_ID;
 
     use super::{
-        _install_mod, extract_mod, Cursor, InstalledMod, ModInstallation, ModInstallationOutcome,
-        Path,
+        _install_mod, extract_mod, file_id_for, Cursor, InstalledMod, Mod, ModInstallation,
+        ModInstallationOutcome, Path,
     };
 
     /// A small mod whose Windows and Android files have different ids, so
@@ -447,25 +464,24 @@ mod tests {
         assert!(!dir.path().join("pallet.json").exists());
     }
 
-    /// Bonelab names the manifest after the mod, e.g. `Aubies12.Bean/
-    /// Aubies12.Bean.pallet.json`, so match on the suffix rather than a fixed
-    /// name.
+    /// Mods in the wild use either a plain `pallet.json` or one named after the
+    /// mod, like `Aubies12.Bean.pallet.json`, so accept both.
     fn has_pallet(folder: &Path) -> bool {
         folder
             .read_dir()
             .unwrap()
             .filter_map(Result::ok)
             .any(|entry| {
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .ends_with(".pallet.json")
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+
+                name == "pallet.json" || name.ends_with(".pallet.json")
             })
     }
 
     /// Mirrors what `authentication::builder` sets up, since both the user
     /// agent and the host are load bearing against the live API.
-    fn live_client() -> Client {
+    fn live_client(target_platform: TargetPlatform) -> Client {
         let api_key = env::var("MODIO_API_KEY").expect("MODIO_API_KEY must be set for this test");
 
         Client::builder(api_key)
@@ -475,24 +491,45 @@ mod tests {
                 env!("CARGO_PKG_VERSION")
             ))
             .game_host(GameId::new(BONELAB_GAME_ID))
-            .target_platform(TargetPlatform::WINDOWS)
+            .target_platform(target_platform)
             .build()
+            .unwrap()
+    }
+
+    fn total_size(dir: &Path) -> u64 {
+        dir.read_dir()
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| {
+                let path = entry.path();
+
+                if path.is_dir() {
+                    total_size(&path)
+                } else {
+                    path.metadata().map(|metadata| metadata.len()).unwrap_or(0)
+                }
+            })
+            .sum()
+    }
+
+    async fn fetch_live_mod(client: &Client) -> Mod {
+        client
+            .get_mod(GameId::new(BONELAB_GAME_ID), ModId::new(LIVE_MOD_ID))
+            .await
+            .unwrap()
+            .data()
+            .await
             .unwrap()
     }
 
     /// Fetches the mod fresh each time, the way a real run would.
     async fn install_live_mod(
         client: &Arc<Client>,
+        target_platform: TargetPlatform,
         mods_dir: &Path,
         installed_mod: Option<InstalledMod>,
     ) -> ModInstallationOutcome {
-        let r#mod = client
-            .get_mod(GameId::new(BONELAB_GAME_ID), ModId::new(LIVE_MOD_ID))
-            .await
-            .unwrap()
-            .data()
-            .await
-            .unwrap();
+        let r#mod = fetch_live_mod(client).await;
         let mut mod_installation =
             ModInstallation::new(r#mod.name.clone(), ProgressBar::hidden()).unwrap();
 
@@ -500,7 +537,7 @@ mod tests {
             r#mod,
             &mut mod_installation,
             Arc::clone(client),
-            TargetPlatform::WINDOWS,
+            target_platform,
             mods_dir.to_path_buf(),
             installed_mod,
         )
@@ -518,10 +555,10 @@ mod tests {
     #[ignore = "hits the live mod.io API"]
     async fn installs_a_real_mod_from_modio() {
         let dir = tempfile::tempdir().unwrap();
-        let client = Arc::new(live_client());
+        let client = Arc::new(live_client(TargetPlatform::WINDOWS));
 
         let ModInstallationOutcome::Installed(mod_id, installed_mod) =
-            install_live_mod(&client, dir.path(), None).await
+            install_live_mod(&client, TargetPlatform::WINDOWS, dir.path(), None).await
         else {
             panic!("expected a fresh install");
         };
@@ -540,7 +577,13 @@ mod tests {
         // Running again against what we just recorded should download nothing.
         assert!(
             matches!(
-                install_live_mod(&client, dir.path(), Some(installed_mod.clone())).await,
+                install_live_mod(
+                    &client,
+                    TargetPlatform::WINDOWS,
+                    dir.path(),
+                    Some(installed_mod.clone())
+                )
+                .await,
                 ModInstallationOutcome::AlreadyInstalled,
             ),
             "an up to date mod was not left alone",
@@ -553,7 +596,7 @@ mod tests {
             folder: installed_mod.folder.clone(),
         };
         let ModInstallationOutcome::Updated(_, updated) =
-            install_live_mod(&client, dir.path(), Some(stale)).await
+            install_live_mod(&client, TargetPlatform::WINDOWS, dir.path(), Some(stale)).await
         else {
             panic!("expected an update");
         };
@@ -562,6 +605,78 @@ mod tests {
         assert!(
             has_pallet(&dir.path().join(&updated.folder)),
             "update left the mod folder incomplete",
+        );
+
+        // The record is only a cache of what is on disk. Someone who deletes a
+        // mod folder by hand should get it back, not be told it is installed.
+        std::fs::remove_dir_all(&folder).unwrap();
+
+        let ModInstallationOutcome::Installed(_, reinstalled) = install_live_mod(
+            &client,
+            TargetPlatform::WINDOWS,
+            dir.path(),
+            Some(installed_mod.clone()),
+        )
+        .await
+        else {
+            panic!("a mod whose folder was deleted was not reinstalled");
+        };
+
+        assert!(
+            has_pallet(&dir.path().join(&reinstalled.folder)),
+            "reinstall left the mod folder incomplete",
+        );
+    }
+
+    /// Quest mods are a separate build, and handing a Quest user the Windows
+    /// file would give them something Bonelab cannot load.
+    #[tokio::test]
+    #[ignore = "hits the live mod.io API"]
+    async fn picks_the_mod_file_for_the_target_platform() {
+        const WINDOWS_FILE_ID: u64 = 8080373;
+        const ANDROID_FILE_ID: u64 = 8080376;
+
+        let r#mod = fetch_live_mod(&live_client(TargetPlatform::WINDOWS)).await;
+
+        assert_eq!(
+            file_id_for(&r#mod, TargetPlatform::WINDOWS).unwrap().get(),
+            WINDOWS_FILE_ID,
+        );
+        assert_eq!(
+            file_id_for(&r#mod, TargetPlatform::ANDROID).unwrap().get(),
+            ANDROID_FILE_ID,
+        );
+    }
+
+    /// Proves the platform choice reaches the disk, rather than only the file
+    /// id we asked for.
+    #[tokio::test]
+    #[ignore = "hits the live mod.io API"]
+    async fn installs_a_different_build_for_quest() {
+        let windows_dir = tempfile::tempdir().unwrap();
+        let android_dir = tempfile::tempdir().unwrap();
+
+        for (target_platform, dir) in [
+            (TargetPlatform::WINDOWS, &windows_dir),
+            (TargetPlatform::ANDROID, &android_dir),
+        ] {
+            let client = Arc::new(live_client(target_platform));
+            let ModInstallationOutcome::Installed(_, installed_mod) =
+                install_live_mod(&client, target_platform, dir.path(), None).await
+            else {
+                panic!("expected a fresh install for {target_platform}");
+            };
+
+            assert!(
+                has_pallet(&dir.path().join(&installed_mod.folder)),
+                "the {target_platform} install left the mod folder incomplete",
+            );
+        }
+
+        assert_ne!(
+            total_size(windows_dir.path()),
+            total_size(android_dir.path()),
+            "the Quest install is byte for byte the Windows one",
         );
     }
 }

@@ -27,6 +27,12 @@ const PLATFORM_VAR: &str = "BMM_PLATFORM";
 
 #[derive(Serialize, Deserialize, Default)]
 pub(crate) struct AppData {
+    /// Where Windows builds used to keep the mod.io token, before it moved into
+    /// the credential store.
+    ///
+    /// Kept so an existing install can be migrated, and because dropping it
+    /// would change the on disk layout and lose the record of what is
+    /// installed, forcing every mod to be downloaded again.
     #[cfg(target_os = "windows")]
     pub(crate) modio_token: Option<String>,
     #[cfg(target_os = "windows")]

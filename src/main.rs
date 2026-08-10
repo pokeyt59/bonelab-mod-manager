@@ -29,6 +29,22 @@ const BONELAB_GAME_ID: u64 = 3809;
 
 const CONCURRENT_DOWNLOADS_VAR: &str = "BMM_CONCURRENT_DOWNLOADS";
 
+/// Forgets the saved mod.io token, bringing the sign in chooser back.
+const SIGN_OUT_FLAG: &str = "--sign-out";
+
+/// Forgets the stored mod.io token so the next run asks how to sign in again.
+///
+/// Being signed out already is not a failure: either way there is no token left
+/// by the time this returns.
+async fn sign_out() -> Result<()> {
+    debug!("signing out");
+
+    delete_password().await?;
+    println!("{}", style("Signed out of mod.io").bold().green());
+
+    Ok(())
+}
+
 async fn try_main() -> Result<()> {
     debug!("entering `try_main()`");
 
@@ -58,6 +74,14 @@ async fn try_main() -> Result<()> {
 
     // authenticate with mod.io
     let client = Arc::new(authenticate(target_platform).await?);
+
+    // Signing in may have just stored a token, and the copy read above predates
+    // that. Without picking it up again, the writes further down would put the
+    // token-less copy back and the next run would ask the user to sign in all
+    // over again.
+    app_data = AppData::read().await?;
+
+    debug!("re-read app data after signing in");
 
     // get subscribed mods
     let request = client
@@ -222,6 +246,17 @@ async fn main() {
     env_logger::init();
 
     debug!("`env_logger` initialized");
+
+    // Handled before `try_main` so that signing out still works when the saved
+    // data is in a state the rest of the program would trip over, and so the
+    // "completed" summary meant for a sync does not follow it.
+    if env::args().any(|arg| arg == SIGN_OUT_FLAG) {
+        if let Err(err) = sign_out().await {
+            eprintln!("{}: {err:#}", style("Error").red());
+        }
+
+        return wait_to_quit();
+    }
 
     match try_main().await {
         Ok(_) => println!(
