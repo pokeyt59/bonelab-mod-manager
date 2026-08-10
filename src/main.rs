@@ -2,9 +2,9 @@ mod app_data;
 mod authentication;
 mod installation;
 
-use std::env;
+use std::{collections::HashSet, env, sync::Arc};
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use app_data::AppData;
 use authentication::{authenticate, delete_password};
 use console::{style, Key, Term};
@@ -13,94 +13,86 @@ use dialoguer::{theme::ColorfulTheme, Select};
 #[cfg(debug_assertions)]
 use env_logger::Env;
 use indicatif::{MultiProgress, ProgressBar};
-use installation::{install_mod, ModInstallationState};
+use installation::{install_mod, remove_installed_mod, ModInstallationOutcome};
 use log::debug;
-use modio::{filter::In, mods, types::id::ModId};
-use tokio::{
-    fs::{remove_dir_all, remove_file},
-    io,
-    task::JoinSet,
+use modio::{
+    request::{filter::prelude::Eq as _, mods::filters::GameId},
+    types::mods::Mod,
+    util::{Paginate, PaginateError},
 };
+use tokio::task::JoinSet;
 
 #[cfg(target_os = "windows")]
 use crate::app_data::BonelabPlatform;
 
-const BONELAB_GAME_ID: u32 = 3809;
+const BONELAB_GAME_ID: u64 = 3809;
+
+const CONCURRENT_DOWNLOADS_VAR: &str = "BMM_CONCURRENT_DOWNLOADS";
 
 async fn try_main() -> Result<()> {
     debug!("entering `try_main()`");
 
-    // authenticate with mod.io
-    let modio = authenticate().await?;
-
-    // choose platform
     let mut app_data = AppData::read().await?;
 
+    // Choosing the platform has to come before signing in: the mod.io client
+    // is told which platform to serve mod files for when it is built.
     #[cfg(target_os = "windows")]
-    if let None = app_data.platform {
+    if app_data.platform.is_none() && BonelabPlatform::from_var()?.is_none() {
         let select = Select::with_theme(&ColorfulTheme::default())
             .with_prompt("Which platform do you play Bonelab on?")
             .item("Windows")
             .item("Quest")
             .default(0)
             .interact()?;
-        let platform = BonelabPlatform::try_from(select)?;
 
-        app_data.platform = Some(platform);
+        app_data.platform = Some(BonelabPlatform::try_from(select)?);
+        app_data.write().await?;
     }
 
     debug!("platform chosen");
 
-    // get subscribed mods
-    let mut subscriptions = modio
-        .user()
-        .subscriptions(mods::filters::GameId::_in(BONELAB_GAME_ID))
-        .collect()
-        .await?;
+    let target_platform = app_data.platform()?.target_platform();
+    let mods_dir = app_data.mods_dir_path()?;
 
-    debug!("got subscribed mods");
+    debug!("mods dir is \"{}\"", mods_dir.display());
+
+    // authenticate with mod.io
+    let client = Arc::new(authenticate(target_platform).await?);
+
+    // get subscribed mods
+    let request = client
+        .get_user_subscriptions()
+        .filter(GameId::eq(BONELAB_GAME_ID));
+    let mut pages = request.paged();
+    let mut subscriptions = Vec::new();
+
+    while let Some(page) = pages.next().await? {
+        subscriptions.extend(page);
+    }
+
+    debug!("got {} subscribed mods", subscriptions.len());
 
     // remove installed mod if not subscribed
-    let mut removed_mods = 0;
+    let subscribed_ids: HashSet<u64> = subscriptions
+        .iter()
+        .map(|subscription| subscription.id.get())
+        .collect();
+    let unsubscribed: Vec<_> = app_data
+        .installed_mods
+        .iter()
+        .filter(|(installed_mod_id, _)| !subscribed_ids.contains(installed_mod_id))
+        .map(|(installed_mod_id, installed_mod)| (*installed_mod_id, installed_mod.clone()))
+        .collect();
+    let removed_mods = unsubscribed.len();
 
-    for (installed_mod_id, installed_mod) in app_data.installed_mods.clone() {
-        if let Err(_) =
-            subscriptions.binary_search_by(|r#mod| r#mod.id.cmp(&ModId::new(installed_mod_id)))
-        {
-            let installed_mod_path = app_data.mods_dir_path()?.join(&installed_mod.folder);
+    for (installed_mod_id, installed_mod) in unsubscribed {
+        debug!(
+            "removing installed mod with id `{installed_mod_id}` and folder \"{}\"",
+            installed_mod.folder.to_string_lossy(),
+        );
 
-            debug!(
-                "removing installed mod with id `{}` and folder \"{}\"",
-                installed_mod_id,
-                installed_mod_path.display(),
-            );
-
-            let maybe_err;
-
-            // If it's a code mod, attempt to remove file instead of directory
-            if let Some(extension) = installed_mod_path.extension() {
-                if extension == "dll" {
-                    debug!("mod is probably a code mod");
-                    maybe_err = remove_file(installed_mod_path).await.err();
-                } else {
-                    debug!("mod is probably not a code mod, but has an extension");
-                    maybe_err = remove_dir_all(installed_mod_path).await.err();
-                }
-            } else {
-                debug!("mod is probably not a code mod");
-                maybe_err = remove_dir_all(installed_mod_path).await.err();
-            }
-
-            if let Some(err) = maybe_err {
-                if err.kind() != io::ErrorKind::NotFound {
-                    bail!(err);
-                }
-            }
-
-            app_data.installed_mods.remove(&installed_mod_id);
-
-            removed_mods += 1;
-        }
+        remove_installed_mod(&mods_dir, &installed_mod).await?;
+        app_data.installed_mods.remove(&installed_mod_id);
     }
 
     app_data.write().await?;
@@ -109,25 +101,39 @@ async fn try_main() -> Result<()> {
     // spawn a task for each mod
     let mut set = JoinSet::new();
     let multi_progress = MultiProgress::new();
-    let concurrent_downloads: u8 =
-        if let Ok(concurrent_downloads) = env::var("BMM_CONCURRENT_DOWNLOADS") {
-            concurrent_downloads.parse()?
-        } else {
-            4
+    let concurrent_downloads: u8 = match env::var(CONCURRENT_DOWNLOADS_VAR) {
+        Ok(concurrent_downloads) => concurrent_downloads.parse()?,
+        Err(_) => 4,
+    };
+
+    // Snapshotted so the loop below is free to record results into `app_data`
+    // as they arrive.
+    let previously_installed = app_data.installed_mods.clone();
+    let spawn_next = |set: &mut JoinSet<Result<ModInstallationOutcome>>,
+                      subscriptions: &mut Vec<Mod>| {
+        let Some(subscription) = subscriptions.pop() else {
+            debug!("no more subscriptions");
+
+            return false;
         };
+        let installed_mod = previously_installed.get(&subscription.id.get()).cloned();
+
+        debug!("spawning task for \"{}\"", subscription.name);
+        set.spawn(install_mod(
+            subscription,
+            multi_progress.add(ProgressBar::new_spinner()),
+            Arc::clone(&client),
+            target_platform,
+            mods_dir.clone(),
+            installed_mod,
+        ));
+        debug!("spawned task");
+
+        true
+    };
 
     for _ in 0..concurrent_downloads {
-        if let Some(subscription) = subscriptions.pop() {
-            debug!("spawning task for \"{}\"", subscription.name);
-            set.spawn(install_mod(
-                subscription,
-                multi_progress.add(ProgressBar::new_spinner()),
-                modio.clone(),
-                app_data.installed_mods.clone(),
-            ));
-            debug!("spawned task");
-        } else {
-            debug!("no more subscriptions");
+        if !spawn_next(&mut set, &mut subscriptions) {
             break;
         }
     }
@@ -138,26 +144,26 @@ async fn try_main() -> Result<()> {
     let mut failed = 0;
 
     while let Some(res) = set.join_next().await {
+        // Only this loop touches the app data, so concurrent installs can't
+        // overwrite each other's bookkeeping the way they could when every
+        // task read and wrote the file itself.
         match res?? {
-            ModInstallationState::Installed => installed += 1,
-            ModInstallationState::Updated => updated += 1,
-            ModInstallationState::AlreadyInstalled => already_installed += 1,
-            ModInstallationState::Failed => failed += 1,
-            _ => unreachable!(),
+            ModInstallationOutcome::Installed(mod_id, installed_mod) => {
+                app_data.installed_mods.insert(mod_id.get(), installed_mod);
+                app_data.write().await?;
+                installed += 1;
+            }
+            ModInstallationOutcome::Updated(mod_id, installed_mod) => {
+                app_data.installed_mods.insert(mod_id.get(), installed_mod);
+                app_data.write().await?;
+                updated += 1;
+            }
+            ModInstallationOutcome::AlreadyInstalled => already_installed += 1,
+            ModInstallationOutcome::Failed => failed += 1,
         }
 
         debug!("task finished, another concurrent download can be made");
-
-        if let Some(subscription) = subscriptions.pop() {
-            debug!("spawning task for \"{}\"", subscription.name);
-            set.spawn(install_mod(
-                subscription,
-                multi_progress.add(ProgressBar::new_spinner()),
-                modio.clone(),
-                app_data.installed_mods.clone(),
-            ));
-            debug!("spawned task");
-        }
+        spawn_next(&mut set, &mut subscriptions);
     }
 
     println!(
@@ -173,18 +179,38 @@ async fn try_main() -> Result<()> {
     Ok(())
 }
 
+/// Holds the window open so someone who launched the program by double
+/// clicking it can read the summary before it disappears.
 fn wait_to_quit() {
     debug!("waiting to quit");
 
     let term = Term::stdout();
 
+    // A redirected run has nobody to press the key, and reading one would hang.
+    if !term.is_term() {
+        debug!("not attached to a terminal, quitting immediately");
+
+        return;
+    }
+
     term.write_line(&style("Press q to quit").bold().to_string())
         .unwrap();
 
-    loop {
-        if term.read_key().unwrap() == Key::Char('q') {
-            break;
-        }
+    while !matches!(term.read_key(), Ok(Key::Char('q')) | Err(_)) {}
+}
+
+/// Whether mod.io rejected our credentials.
+///
+/// The error arrives wrapped differently depending on which call produced it,
+/// so unwrapping one layer isn't enough.
+fn is_auth_error(err: &anyhow::Error) -> bool {
+    if let Some(err) = err.downcast_ref::<modio::Error>() {
+        return err.is_auth();
+    }
+
+    match err.downcast_ref::<PaginateError>() {
+        Some(PaginateError::Request(err)) => err.is_auth(),
+        _ => false,
     }
 }
 
@@ -205,17 +231,13 @@ async fn main() {
                 .green()
         ),
         Err(err) => {
-            if let Some(err) = err.downcast_ref::<modio::Error>() {
-                if err.is_auth() {
-                    if let Ok(_) = delete_password().await {
-                        eprintln!(
-                            "{}: Authentication failed, you have been signed out",
-                            style("Error").red()
-                        );
+            if is_auth_error(&err) && delete_password().await.is_ok() {
+                eprintln!(
+                    "{}: Authentication failed, you have been signed out",
+                    style("Error").red()
+                );
 
-                        return wait_to_quit();
-                    }
-                }
+                return wait_to_quit();
             }
 
             if let Ok(backtrace) = env::var("RUST_BACKTRACE") {

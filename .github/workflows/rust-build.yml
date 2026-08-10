@@ -16,8 +16,8 @@ jobs:
   build-windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v3
-      - uses: actions/cache@v3
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/bin/
@@ -31,7 +31,7 @@ jobs:
         run: cargo build --release --verbose
       - name: Upload release artifact
         if: ${{ !inputs.debug }}
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: bonelab_mod_manager-${{ runner.os }}-release
           path: target/release/bonelab_mod_manager.exe
@@ -40,7 +40,7 @@ jobs:
         run: cargo build --verbose
       - name: Upload debug artifact
         if: ${{ inputs.debug }}
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: bonelab_mod_manager-${{ runner.os }}-debug
           path: target/debug/bonelab_mod_manager.exe
@@ -48,8 +48,8 @@ jobs:
     if: ${{ !inputs.debug }}
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v3
-      - uses: actions/cache@v3
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/bin/
@@ -80,7 +80,7 @@ jobs:
             -srcfolder "Bonelab Mod Manager Installer" \
             bonelab_mod_manager.dmg
       - name: Upload artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: bonelab_mod_manager-${{ runner.os }}
           path: bonelab_mod_manager.dmg
@@ -88,8 +88,8 @@ jobs:
     if: ${{ !inputs.debug }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
-      - uses: actions/cache@v3
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/bin/
@@ -103,7 +103,7 @@ jobs:
       - name: Create TAR
         run: tar -czvf bonelab_mod_manager.tar.gz -C target/release bonelab_mod_manager
       - name: Upload artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: bonelab_mod_manager-${{ runner.os }}
           path: bonelab_mod_manager.tar.gz

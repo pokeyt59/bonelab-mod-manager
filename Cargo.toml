@@ -1,9 +1,10 @@
 [package]
 name = "bonelab_mod_manager"
 # Remember to update the version in `Info.plist`!
-version = "0.6.3"
+version = "0.7.0"
 authors = ["Valentine Briese <valentinegb@icloud.com>"]
 edition = "2021"
+rust-version = "1.83"
 description = "Keeps your installed Bonelab mods synced with your subscribed mod.io mods."
 repository = "https://github.com/valentinegb/bonelab_mod_manager"
 license = "MIT"
@@ -13,18 +14,23 @@ publish = false
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-anyhow = { version = "1.0.82", features = ["backtrace"] }
-console = "0.15.8"
-dialoguer = { version = "0.11.0", default-features = false, features = ["password"] }
-env_logger = "0.11.3"
-futures-util = { version = "0.3.30", features = ["tokio-io"] }
-indicatif = { version = "0.17.8", features = ["tokio"] }
-log = "0.4.21"
-modio = "0.10.1"
-postcard = { version = "1.0.8", features = ["use-std"] }
-serde = { version = "1.0.197", features = ["derive"] }
-tokio = { version = "1.37.0", features = ["full"] }
-zip = "1.1.2"
+anyhow = { version = "1.0.104", features = ["backtrace"] }
+console = "0.16.4"
+dialoguer = { version = "0.12.0", default-features = false, features = ["password"] }
+env_logger = "0.11.11"
+indicatif = "0.18.6"
+log = "0.4.33"
+modio = "0.14.2"
+postcard = { version = "1.1.3", features = ["use-std"] }
+serde = { version = "1.0.229", features = ["derive"] }
+tokio = { version = "1.53.1", features = ["full"] }
+zip = "8.6.0"
 
 [target.'cfg(unix)'.dependencies]
-keyring = "2.3.2"
+keyring = "4.1.6"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[build-dependencies]
+embed-resource = "3.0.11"

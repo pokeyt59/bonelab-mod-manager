@@ -1,18 +1,29 @@
-#[cfg(target_os = "windows")]
-use std::fmt::{self, Display, Formatter};
 use std::{
     collections::HashMap,
     env::{self, VarError},
     ffi::OsString,
+    fmt::{self, Display, Formatter},
     path::PathBuf,
 };
 
-#[cfg(target_os = "windows")]
-use anyhow::anyhow;
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use log::debug;
+use modio::types::TargetPlatform;
 use serde::{Deserialize, Serialize};
 use tokio::fs;
+
+/// Overrides the directory mods are installed into.
+///
+/// Needed for setups the built-in paths don't cover, such as Bonelab running
+/// under Proton on Linux or the Steam Deck, where the game's `LocalLow`
+/// directory lives inside a Wine prefix.
+const MODS_DIR_VAR: &str = "BMM_MODS_DIR";
+
+/// Overrides the saved platform choice.
+///
+/// The choice is otherwise made once, on first run, and there is no other way
+/// to revisit it.
+const PLATFORM_VAR: &str = "BMM_PLATFORM";
 
 #[derive(Serialize, Deserialize, Default)]
 pub(crate) struct AppData {
@@ -23,14 +34,40 @@ pub(crate) struct AppData {
     pub(crate) installed_mods: HashMap<u64, InstalledMod>,
 }
 
-#[cfg(target_os = "windows")]
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BonelabPlatform {
     Windows,
     Quest,
 }
 
-#[cfg(target_os = "windows")]
+impl BonelabPlatform {
+    /// The mod.io platform whose mod files this Bonelab install can load.
+    ///
+    /// Quest is an Android device, so its mod files are published under
+    /// mod.io's `android` platform rather than `oculus`, which mod.io uses for
+    /// Rift-era PC titles.
+    pub(crate) fn target_platform(self) -> TargetPlatform {
+        match self {
+            Self::Windows => TargetPlatform::WINDOWS,
+            Self::Quest => TargetPlatform::ANDROID,
+        }
+    }
+
+    pub(crate) fn from_var() -> Result<Option<Self>> {
+        let Some(value) = env::var_os(PLATFORM_VAR) else {
+            return Ok(None);
+        };
+
+        match value.to_string_lossy().to_lowercase().as_str() {
+            "windows" | "pc" => Ok(Some(Self::Windows)),
+            "quest" | "android" => Ok(Some(Self::Quest)),
+            other => Err(anyhow!(
+                "{PLATFORM_VAR} must be \"windows\" or \"quest\", got \"{other}\""
+            )),
+        }
+    }
+}
+
 impl TryFrom<usize> for BonelabPlatform {
     type Error = anyhow::Error;
 
@@ -45,7 +82,6 @@ impl TryFrom<usize> for BonelabPlatform {
     }
 }
 
-#[cfg(target_os = "windows")]
 impl Display for BonelabPlatform {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(
@@ -93,28 +129,58 @@ impl AppData {
         Ok(Self::dir_path()?.join("app_data"))
     }
 
-    #[cfg(target_os = "windows")]
+    /// Which Bonelab install mods are being managed for.
+    ///
+    /// Bonelab only ships on Windows and Quest, so a non-Windows host can only
+    /// ever be staging mods for a headset.
+    pub(crate) fn platform(&self) -> Result<BonelabPlatform> {
+        if let Some(platform) = BonelabPlatform::from_var()? {
+            debug!("using platform from {PLATFORM_VAR}");
+
+            return Ok(platform);
+        }
+
+        #[cfg(target_os = "windows")]
+        return self.platform.ok_or(anyhow!("Platform is not set"));
+        #[cfg(target_family = "unix")]
+        return Ok(BonelabPlatform::Quest);
+    }
+
     pub(crate) fn mods_dir_path(&self) -> Result<PathBuf> {
         debug!("getting mods dir path");
 
-        match self
-            .platform
-            .as_ref()
-            .ok_or(anyhow!("Platform is not set"))?
-        {
-            BonelabPlatform::Windows => Ok(PathBuf::from(env::var("AppData")?)
-                .parent()
-                .ok_or(anyhow!("AppData env var value does not have parent"))?
-                .join("Locallow/Stress Level Zero/Bonelab/Mods")),
+        if let Some(path) = env::var_os(MODS_DIR_VAR) {
+            debug!("using mods dir path from {MODS_DIR_VAR}");
+
+            return Ok(PathBuf::from(path));
+        }
+
+        match self.platform()? {
+            BonelabPlatform::Windows => Ok(Self::local_low_dir_path()?
+                .join("Stress Level Zero")
+                .join("BONELAB")
+                .join("Mods")),
             BonelabPlatform::Quest => Ok(Self::dir_path()?.join("Mods")),
         }
     }
 
-    #[cfg(target_family = "unix")]
-    pub(crate) fn mods_dir_path(&self) -> Result<PathBuf> {
-        debug!("getting mods dir path");
+    /// `%UserProfile%\AppData\LocalLow`, where Unity games keep their save data.
+    ///
+    /// Both the Steam and the Meta PC builds of Bonelab read mods from here.
+    #[cfg(target_os = "windows")]
+    fn local_low_dir_path() -> Result<PathBuf> {
+        Ok(PathBuf::from(env::var("AppData")?)
+            .parent()
+            .ok_or(anyhow!("AppData env var value does not have parent"))?
+            .join("LocalLow"))
+    }
 
-        Ok(Self::dir_path()?.join("Mods"))
+    #[cfg(target_family = "unix")]
+    fn local_low_dir_path() -> Result<PathBuf> {
+        Err(anyhow!(
+            "Bonelab for Windows cannot be installed on this operating system; \
+             set {MODS_DIR_VAR} to the game's Mods directory to manage a Proton install"
+        ))
     }
 
     async fn write_default() -> Result<Self> {
@@ -130,28 +196,25 @@ impl AppData {
         let path = Self::path()?;
 
         if !fs::try_exists(&path).await? {
-            return Ok(Self::write_default().await?);
+            return Self::write_default().await;
         }
 
-        let app_data = postcard::from_bytes(&fs::read(path).await?);
+        // Anything that fails to deserialize is either corrupt or was written
+        // by a version with a different layout. Neither is worth failing over:
+        // the file is a cache of what's installed, and starting over just means
+        // mods get reinstalled once.
+        match postcard::from_bytes(&fs::read(path).await?) {
+            Ok(app_data) => {
+                debug!("read app data");
 
-        debug!("deserialized app data");
+                Ok(app_data)
+            }
+            Err(err) => {
+                debug!("app data is unreadable ({err}), resetting");
 
-        if app_data
-            .as_ref()
-            .is_err_and(|err| *err == postcard::Error::DeserializeUnexpectedEnd)
-            || app_data
-                .as_ref()
-                .is_err_and(|err| *err == postcard::Error::SerdeDeCustom)
-        {
-            debug!("app data is borked, resetting");
-
-            return Ok(Self::write_default().await?);
+                Ok(Self::write_default().await?)
+            }
         }
-
-        debug!("read app data");
-
-        Ok(app_data?)
     }
 
     pub(crate) async fn write(&self) -> Result<()> {

@@ -68,7 +68,7 @@ There are some steps that you must take once the first time that you launch the 
    > Bonelab Mod Manager uses keychain/keyring to securely store your mod.io token. This ensures that no program can access your token without explicity asking user permission, this includes Bonelab Mod Manager.
 2. You will be prompted to sign in to mod.io. Use the arrow keys to select your method of signing in then press enter.
    - If you select "Send me an email code" you will need to type in the email associated with your mod.io account. You will shortly after receive an email from mod.io containing a code, which you will also need to enter into the program.
-   - Selecting "Let me input my token" is a little more complicated. You will need to go to [mod.io Account Access](https://mod.io/me/access) and generate a token with read permissions. (You do **NOT** need to give write permissions and I advise that you don't.) You can name the client and the token whatever you'd like, it doesn't matter.
+   - Selecting "Let me input my token" is a little more complicated. You will need to go to [mod.io Account Access](https://mod.io/me/access) and generate a token with read permissions. (You do **NOT** need to give write permissions and I advise that you don't.) You can name the client and the token whatever you'd like, it doesn't matter. The token is hidden as you type it; if your terminal refuses to paste into a hidden prompt, set the `BMM_MODIO_TOKEN` environment variable instead.
 3. If you are on Windows, you will be prompted whether you would like to install PC mods or Quest mods.
 
 After these steps, you can use Bonelab Mod Manager like normal.
@@ -88,9 +88,14 @@ After these steps, you can use Bonelab Mod Manager like normal.
 1. Unsubscribe to the mod on [mod.io](https://mod.io/g/bonelab).
 2. Launch Bonelab Mod Manager and it will remove the mod.
 
-## Quest Mod Installation Path
+## Mod Installation Paths
 
-PC mods are installed directly into a PC Bonelab installation, but Quest mods must be manually put onto your headset. Quest mods are installed in a directory dependent on your OS.
+PC mods are installed directly into your Bonelab installation, at
+`%UserProfile%/AppData/LocalLow/Stress Level Zero/BONELAB/Mods`. This is the
+same path for both the Steam and the Meta PC versions of the game.
+
+Quest mods must be manually put onto your headset, so they are installed to a
+staging directory that depends on your OS.
 
 macOS: `~/Library/Application Support/com.valentinegb.bonelab_mod_manager/Mods`
 
@@ -98,9 +103,48 @@ Linux: `~/var/lib/bonelab_mod_manager/Mods`
 
 Windows: `%AppData%/bonelab_mod_manager/Mods`
 
+Copy them from there to `Android/data/com.StressLevelZero.BONELAB/files/Mods` on
+your headset.
+
 I know, it isn't ideal having to move the mods from this folder to your headset,
 but it's on the roadmap for the mod manager to do that for you, it will in the future!
 
-## Configuring Concurrent Downloads
+## Configuration
 
-By default, Bonelab Mod Manager will install 4 mods at a time. This is configurable however since hardware can differ drastically. To change the maximum number of concurrent downloads, set the `BMM_CONCURRENT_DOWNLOADS` environment variable.
+Bonelab Mod Manager is configured through environment variables.
+
+| Variable | Purpose |
+| --- | --- |
+| `BMM_CONCURRENT_DOWNLOADS` | How many mods to install at a time. Defaults to 4, since hardware differs drastically. |
+| `BMM_MODS_DIR` | Installs mods here instead of the built-in path. Use this if you run Bonelab through Proton on Linux or the Steam Deck, where the game's `LocalLow` directory lives inside a Wine prefix. |
+| `BMM_PLATFORM` | `windows` or `quest`. Overrides the platform you picked on first run, which is otherwise saved for good. |
+| `BMM_MODIO_TOKEN` | Signs in with this mod.io token instead of prompting. The token is used as-is and is not saved. |
+| `MODIO_API_KEY` | The mod.io API key to run against. Only needed for builds that had no key compiled in. |
+
+## Building From Source
+
+Bonelab Mod Manager talks to mod.io with an API key, which you can generate at
+[mod.io Account Access](https://mod.io/me/access). Set `MODIO_API_KEY` when you
+build to bake the key into the executable:
+
+```sh
+MODIO_API_KEY=your_key cargo build --release
+```
+
+You can also build without a key and supply `MODIO_API_KEY` at run time instead.
+
+### Testing
+
+`cargo test` runs the offline tests and skips the one that talks to mod.io.
+
+There is also a live test that downloads and installs a real mod, which is the
+only way to cover platform file selection, the download itself, and extracting
+an archive we did not build. It needs a key and the network:
+
+```sh
+MODIO_API_KEY=your_key cargo test -- --ignored --nocapture
+```
+
+Build with `MODIO_API_KEY` unset if you do not want the key compiled into the
+test binary, then set it only when running the binary. It installs into a
+temporary directory, so your Mods folder is not touched.
