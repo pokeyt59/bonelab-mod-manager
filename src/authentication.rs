@@ -202,22 +202,25 @@ pub(super) async fn authenticate(
     Ok(Authentication::SignedIn(Arc::new(client.with_token(token))))
 }
 
-#[cfg(all(test, target_os = "windows"))]
+#[cfg(test)]
 mod tests {
     use keyring::Entry;
+
+    /// Roughly the length of a token mod.io issues.
+    const TOKEN_LEN: usize = 1822;
+
+    const PROBE_SERVICE: &str = "bonelab_mod_manager_probe";
 
     /// Documents why Windows keeps the token in the app data file rather than
     /// the credential store, so nobody "fixes" it back.
     ///
     /// Ignored by default because it writes to the real credential store, which
     /// cannot be pointed somewhere harmless.
+    #[cfg(target_os = "windows")]
     #[test]
     #[ignore = "writes to the real Windows credential store"]
     fn keyring_cannot_hold_a_modio_token_on_windows() {
-        // Roughly what mod.io issues.
-        const TOKEN_LEN: usize = 1822;
-
-        let entry = Entry::new("bonelab_mod_manager_probe", "probe").unwrap();
+        let entry = Entry::new(PROBE_SERVICE, "probe").unwrap();
 
         assert!(
             entry.set_password(&"a".repeat(512)).is_ok(),
@@ -234,5 +237,39 @@ mod tests {
         );
 
         let _ = entry.delete_credential();
+    }
+
+    /// The counterpart to the Windows test: here the credential store really is
+    /// used for the token, so a token sized secret has to survive a round trip.
+    ///
+    /// Needs a running Secret Service on Linux, meaning a desktop session with
+    /// something like GNOME Keyring or KWallet, so it cannot run on headless CI.
+    #[cfg(target_family = "unix")]
+    #[test]
+    #[ignore = "needs a desktop session with a credential store"]
+    fn keyring_holds_a_modio_token_on_unix() {
+        let entry = Entry::new(PROBE_SERVICE, "probe").unwrap();
+        let secret = "a".repeat(TOKEN_LEN);
+
+        entry
+            .set_password(&secret)
+            .expect("could not store a token sized secret");
+
+        assert_eq!(
+            entry
+                .get_password()
+                .expect("could not read the secret back"),
+            secret,
+            "the credential store altered the secret",
+        );
+
+        entry
+            .delete_credential()
+            .expect("could not delete the secret");
+
+        assert!(
+            entry.get_password().is_err(),
+            "the secret survived deletion",
+        );
     }
 }
