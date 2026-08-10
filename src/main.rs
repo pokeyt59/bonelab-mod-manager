@@ -6,7 +6,7 @@ use std::{collections::HashSet, env, sync::Arc};
 
 use anyhow::Result;
 use app_data::AppData;
-use authentication::{authenticate, delete_password};
+use authentication::{authenticate, delete_password, Authentication};
 use console::{style, Key, Term};
 #[cfg(target_os = "windows")]
 use dialoguer::{theme::ColorfulTheme, Select};
@@ -32,6 +32,18 @@ const CONCURRENT_DOWNLOADS_VAR: &str = "BMM_CONCURRENT_DOWNLOADS";
 /// Forgets the saved mod.io token, bringing the sign in chooser back.
 const SIGN_OUT_FLAG: &str = "--sign-out";
 
+/// Whether the sign in prompt should offer to go back and pick the platform
+/// again.
+///
+/// Only Windows has a choice to make, and `BMM_PLATFORM` overrides whatever is
+/// picked, so offering it in either of those cases would be a lie.
+fn platform_is_changeable() -> Result<bool> {
+    #[cfg(target_os = "windows")]
+    return Ok(BonelabPlatform::from_var()?.is_none());
+    #[cfg(target_family = "unix")]
+    return Ok(false);
+}
+
 /// Forgets the stored mod.io token so the next run asks how to sign in again.
 ///
 /// Being signed out already is not a failure: either way there is no token left
@@ -50,30 +62,53 @@ async fn try_main() -> Result<()> {
 
     let mut app_data = AppData::read().await?;
 
-    // Choosing the platform has to come before signing in: the mod.io client
-    // is told which platform to serve mod files for when it is built.
-    #[cfg(target_os = "windows")]
-    if app_data.platform.is_none() && BonelabPlatform::from_var()?.is_none() {
-        let select = Select::with_theme(&ColorfulTheme::default())
-            .with_prompt("Which platform do you play Bonelab on?")
-            .item("Windows")
-            .item("Quest")
-            .default(0)
-            .interact()?;
+    // Choosing the platform has to come before signing in: the mod.io client is
+    // told which platform to serve mod files for when it is built. Looping lets
+    // someone who picked the wrong one back out of the sign in prompt, since the
+    // choice is otherwise saved for good.
+    let client = loop {
+        #[cfg(target_os = "windows")]
+        if app_data.platform.is_none() && BonelabPlatform::from_var()?.is_none() {
+            let select = Select::with_theme(&ColorfulTheme::default())
+                .with_prompt("Which platform do you play Bonelab on?")
+                .item("Windows")
+                .item("Quest")
+                .default(0)
+                .interact()?;
 
-        app_data.platform = Some(BonelabPlatform::try_from(select)?);
-        app_data.write().await?;
-    }
+            app_data.platform = Some(BonelabPlatform::try_from(select)?);
+            app_data.write().await?;
+        }
 
-    debug!("platform chosen");
+        debug!("platform chosen");
+
+        match authenticate(
+            app_data.platform()?.target_platform(),
+            platform_is_changeable()?,
+        )
+        .await?
+        {
+            Authentication::SignedIn(client) => break client,
+            Authentication::ChangePlatform => {
+                debug!("user asked to choose a different platform");
+
+                #[cfg(target_os = "windows")]
+                {
+                    // Written out too, so backing out and then closing the
+                    // window does not leave the old choice in place.
+                    app_data.platform = None;
+                    app_data.write().await?;
+                }
+                #[cfg(target_family = "unix")]
+                anyhow::bail!("There is only one platform to choose from on this operating system");
+            }
+        }
+    };
 
     let target_platform = app_data.platform()?.target_platform();
     let mods_dir = app_data.mods_dir_path()?;
 
     debug!("mods dir is \"{}\"", mods_dir.display());
-
-    // authenticate with mod.io
-    let client = Arc::new(authenticate(target_platform).await?);
 
     // Signing in may have just stored a token, and the copy read above predates
     // that. Without picking it up again, the writes further down would put the

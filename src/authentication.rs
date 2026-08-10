@@ -1,4 +1,4 @@
-use std::env;
+use std::{env, sync::Arc};
 
 use anyhow::{anyhow, bail, Result};
 use dialoguer::{theme::ColorfulTheme, Input, Password, Select};
@@ -108,7 +108,17 @@ pub(super) async fn delete_password() -> Result<()> {
     app_data.write().await
 }
 
-pub(super) async fn authenticate(target_platform: TargetPlatform) -> Result<Client> {
+/// What came of asking the user to sign in.
+pub(super) enum Authentication {
+    SignedIn(Arc<Client>),
+    /// The user backed out of the sign in prompt to pick their platform again.
+    ChangePlatform,
+}
+
+pub(super) async fn authenticate(
+    target_platform: TargetPlatform,
+    can_change_platform: bool,
+) -> Result<Authentication> {
     // Built up front so a missing API key is reported before the user is asked
     // to go and fetch an email code.
     let builder = builder(target_platform)?;
@@ -116,13 +126,17 @@ pub(super) async fn authenticate(target_platform: TargetPlatform) -> Result<Clie
     if let Ok(token) = env::var(TOKEN_VAR) {
         debug!("got token from {TOKEN_VAR}");
 
-        return Ok(builder.token(token).build()?);
+        return Ok(Authentication::SignedIn(Arc::new(
+            builder.token(token).build()?,
+        )));
     }
 
     if let Ok(token) = get_password().await {
         debug!("got password");
 
-        return Ok(builder.token(token).build()?);
+        return Ok(Authentication::SignedIn(Arc::new(
+            builder.token(token).build()?,
+        )));
     }
 
     debug!("could not get password");
@@ -131,10 +145,16 @@ pub(super) async fn authenticate(target_platform: TargetPlatform) -> Result<Clie
 
     println!("You are not signed in");
 
+    let mut items = vec!["Send me an email code", "Let me input my token"];
+
+    // Offered last so the indices of the two sign in methods do not move.
+    if can_change_platform {
+        items.push("Go back and change platform");
+    }
+
     let selection = Select::with_theme(&ColorfulTheme::default())
         .with_prompt("How would you like to sign in?")
-        .item("Send me an email code")
-        .item("Let me input my token")
+        .items(&items)
         .default(0)
         .interact()?;
 
@@ -168,13 +188,18 @@ pub(super) async fn authenticate(target_platform: TargetPlatform) -> Result<Clie
                 .with_prompt("Enter your token")
                 .interact()?
         }
-        _ => bail!("Selection has index that is more than 1"),
+        2 => {
+            debug!("user wants to change platform");
+
+            return Ok(Authentication::ChangePlatform);
+        }
+        other => bail!("Sign in prompt returned an unexpected selection: {other}"),
     };
 
     set_password(&token).await?;
     debug!("set password");
 
-    Ok(client.with_token(token))
+    Ok(Authentication::SignedIn(Arc::new(client.with_token(token))))
 }
 
 #[cfg(all(test, target_os = "windows"))]

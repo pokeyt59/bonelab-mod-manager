@@ -66,10 +66,13 @@ There are some steps that you must take once the first time that you launch the 
 
 1. If you are on macOS or Linux, you will see a popup for keychain or keyring, respectively. Type in your user password.
    > Bonelab Mod Manager uses keychain/keyring to securely store your mod.io token. This ensures that no program can access your token without explicity asking user permission, this includes Bonelab Mod Manager.
-2. You will be prompted to sign in to mod.io. Use the arrow keys to select your method of signing in then press enter.
+2. If you are on Windows, you will be asked whether you play Bonelab on Windows or Quest. This comes first because mod.io is told which platform to serve mod files for when you sign in.
+3. You will be prompted to sign in to mod.io. Use the arrow keys to select your method of signing in then press enter.
    - If you select "Send me an email code" you will need to type in the email associated with your mod.io account. You will shortly after receive an email from mod.io containing a code, which you will also need to enter into the program.
    - Selecting "Let me input my token" is a little more complicated. You will need to go to [mod.io Account Access](https://mod.io/me/access) and generate a token with read permissions. (You do **NOT** need to give write permissions and I advise that you don't.) You can name the client and the token whatever you'd like, it doesn't matter. The token is hidden as you type it; if your terminal refuses to paste into a hidden prompt, set the `BMM_MODIO_TOKEN` environment variable instead.
-3. If you are on Windows, you will be prompted whether you would like to install PC mods or Quest mods.
+   - "Go back and change platform" returns you to the question in step 2, in case you picked the wrong one. This option is not shown if `BMM_PLATFORM` is set, since that would override whatever you chose.
+
+Picked the wrong platform and only noticed later? Run `--sign-out`, which brings the sign in prompt back, and go back from there.
 
 After these steps, you can use Bonelab Mod Manager like normal.
 
