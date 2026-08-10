@@ -7,13 +7,34 @@ on:
         description: Make debug build
         required: false
         type: boolean
+      release_tag:
+        description: Tag to publish a release as, e.g. v0.7.0. Leave empty to only build.
+        required: false
+        type: string
 
 env:
   CARGO_TERM_COLOR: always
   MODIO_API_KEY: ${{ secrets.MODIO_API_KEY }}
 
 jobs:
+  # `option_env!` treats a missing key as None rather than a build error, so
+  # without this the workflow would cheerfully publish binaries that cannot talk
+  # to mod.io at all, and the first anyone would know is users reporting it.
+  check-api-key:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail if the API key secret is missing
+        run: |
+          if [ -z "$MODIO_API_KEY" ]; then
+            echo "::error::The MODIO_API_KEY secret is not set on this repository."
+            echo "::error::Builds would have no key compiled in and would fail for every user."
+            echo "::error::Set it under Settings, Secrets and variables, Actions."
+            exit 1
+          fi
+          echo "API key secret is present."
+
   build-windows:
+    needs: check-api-key
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -45,6 +66,7 @@ jobs:
           name: bonelab_mod_manager-${{ runner.os }}-debug
           path: target/debug/bonelab_mod_manager.exe
   build-macos:
+    needs: check-api-key
     if: ${{ !inputs.debug }}
     runs-on: macos-latest
     steps:
@@ -85,6 +107,7 @@ jobs:
           name: bonelab_mod_manager-${{ runner.os }}
           path: bonelab_mod_manager.dmg
   build-linux:
+    needs: check-api-key
     if: ${{ !inputs.debug }}
     runs-on: ubuntu-latest
     steps:
@@ -107,3 +130,41 @@ jobs:
         with:
           name: bonelab_mod_manager-${{ runner.os }}
           path: bonelab_mod_manager.tar.gz
+
+  # Workflow artifacts expire and need a GitHub login to download, so they are
+  # no use as public downloads. This attaches them to a real release instead.
+  release:
+    needs: [build-windows, build-macos, build-linux]
+    if: ${{ inputs.release_tag != '' && !inputs.debug }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          # Named explicitly rather than globbed, so a build that quietly
+          # stopped producing one of them fails here instead of publishing a
+          # release that is missing a platform.
+          WINDOWS="artifacts/bonelab_mod_manager-Windows-release/bonelab_mod_manager.exe"
+          MACOS="artifacts/bonelab_mod_manager-macOS/bonelab_mod_manager.dmg"
+          LINUX="artifacts/bonelab_mod_manager-Linux/bonelab_mod_manager.tar.gz"
+
+          for file in "$WINDOWS" "$MACOS" "$LINUX"; do
+            if [ ! -f "$file" ]; then
+              echo "::error::Expected artifact is missing: $file"
+              exit 1
+            fi
+          done
+
+          gh release create "${{ inputs.release_tag }}" \
+            --title "${{ inputs.release_tag }}" \
+            --generate-notes \
+            "$WINDOWS" "$MACOS" "$LINUX"
