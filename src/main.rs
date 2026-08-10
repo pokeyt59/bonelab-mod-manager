@@ -44,6 +44,24 @@ fn platform_is_changeable() -> Result<bool> {
     return Ok(false);
 }
 
+/// Clears the saved platform so the next pass around asks for it again.
+///
+/// Written out rather than only cleared in memory, so backing out and then
+/// closing the window does not leave the old choice in place.
+#[cfg(target_os = "windows")]
+async fn forget_platform(app_data: &mut AppData) -> Result<()> {
+    app_data.platform = None;
+
+    app_data.write().await
+}
+
+/// Quest is the only possibility on the Unix builds, so the sign in prompt
+/// never offers to change platform and this should never be reached.
+#[cfg(target_family = "unix")]
+async fn forget_platform(_app_data: &mut AppData) -> Result<()> {
+    anyhow::bail!("There is only one platform to choose from on this operating system")
+}
+
 /// Forgets the stored mod.io token so the next run asks how to sign in again.
 ///
 /// Being signed out already is not a failure: either way there is no token left
@@ -92,15 +110,7 @@ async fn try_main() -> Result<()> {
             Authentication::ChangePlatform => {
                 debug!("user asked to choose a different platform");
 
-                #[cfg(target_os = "windows")]
-                {
-                    // Written out too, so backing out and then closing the
-                    // window does not leave the old choice in place.
-                    app_data.platform = None;
-                    app_data.write().await?;
-                }
-                #[cfg(target_family = "unix")]
-                anyhow::bail!("There is only one platform to choose from on this operating system");
+                forget_platform(&mut app_data).await?;
             }
         }
     };
