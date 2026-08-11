@@ -165,15 +165,25 @@ Bonelab Mod Manager is configured through environment variables.
 
 ## Building From Source
 
-Bonelab Mod Manager talks to mod.io with an API key, which you can generate at
-[mod.io Account Access](https://mod.io/me/access). Set `MODIO_API_KEY` when you
-build to bake the key into the executable:
+You will need **your own** mod.io API key. Generating one is free: sign in at
+[mod.io Account Access](https://mod.io/me/access) and create a key for your
+account. Use your own rather than one from someone else's build; a key is read
+only and cannot touch anybody's account, but requests are rate limited per key,
+so sharing one means sharing the limit.
+
+The key is read while you build and compiled into the executable, so whoever
+runs the result never has to supply one:
 
 ```sh
 MODIO_API_KEY=your_key cargo build --release
 ```
 
-You can also build without a key and supply `MODIO_API_KEY` at run time instead.
+Building without a key is fine too. The executable then asks for `MODIO_API_KEY`
+in the environment at run time instead, and says so plainly if it is missing.
+
+Wherever you put your key, it should not end up in the repository.
+`.cargo/config.toml` is in `.gitignore` for exactly that reason, so a key kept
+there cannot be committed by accident.
 
 ### Setting the API Key
 
