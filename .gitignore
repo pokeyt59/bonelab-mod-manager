@@ -15,3 +15,7 @@ target/
 
 # macOS file attributes
 .DS_Store
+
+# Holds the mod.io API key for local builds. Releases get theirs from the
+# repository secret instead, so this must never be committed.
+.cargo/config.toml
