@@ -175,6 +175,41 @@ MODIO_API_KEY=your_key cargo build --release
 
 You can also build without a key and supply `MODIO_API_KEY` at run time instead.
 
+Setting the variable in every new terminal gets old, and forgetting it is worse
+than it sounds: the key is read at build time, cargo notices when it changes, so
+a build in a terminal that lacks it quietly produces an executable with no key
+that fails for whoever runs it. Put it in `.cargo/config.toml` instead, which
+applies to every build in this checkout and is ignored by git:
+
+```toml
+[env]
+MODIO_API_KEY = "your_key"
+```
+
+### Where Builds Go
+
+`cargo build` leaves its output under `target`, named after the crate. The build
+scripts run the build and then file the executable somewhere easier to find,
+under `BUILT`, one folder per operating system:
+
+```sh
+./build.sh        # Linux and macOS, or Git Bash on Windows
+.\build.ps1       # Windows PowerShell
+```
+
+```
+BUILT/
+└── WINDOWS/
+    └── Bonelab-Mod-Manager.exe
+```
+
+Pass `--debug` (`-DebugBuild` in PowerShell) for a debug build, which logs
+everything it does. Both scripts warn if no API key is available rather than
+handing you an executable that cannot talk to mod.io.
+
+Only the operating system you are on can be built this way. The Rust Build
+workflow produces all three, and can attach them to a release.
+
 ### Testing
 
 `cargo test` runs the offline tests and skips the one that talks to mod.io.

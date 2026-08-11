@@ -19,3 +19,7 @@ target/
 # Holds the mod.io API key for local builds. Releases get theirs from the
 # repository secret instead, so this must never be committed.
 .cargo/config.toml
+
+# Where `build.ps1` and `build.sh` file finished executables. Build output, and
+# on Windows it has the API key compiled into it.
+BUILT/
