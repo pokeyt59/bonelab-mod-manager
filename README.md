@@ -175,16 +175,46 @@ MODIO_API_KEY=your_key cargo build --release
 
 You can also build without a key and supply `MODIO_API_KEY` at run time instead.
 
+### Setting the API Key
+
 Setting the variable in every new terminal gets old, and forgetting it is worse
 than it sounds: the key is read at build time, cargo notices when it changes, so
 a build in a terminal that lacks it quietly produces an executable with no key
-that fails for whoever runs it. Put it in `.cargo/config.toml` instead, which
-applies to every build in this checkout and is ignored by git:
+that fails for whoever runs it, with nothing in the build output to say so.
+
+The tidiest answer works the same on every platform. Put it in
+`.cargo/config.toml`, which applies to every build in this checkout and is
+ignored by git:
 
 ```toml
 [env]
-MODIO_API_KEY = "your_key"
+MODIO_API_KEY = { value = "your_key", force = true }
 ```
+
+`force` is not decoration. Without it an environment variable of the same name
+takes precedence, so a stale `MODIO_API_KEY` left in a shell would be compiled
+in instead of this one, silently.
+
+If you would rather use the environment, every one of these works:
+
+| Shell | Scope | How |
+| --- | --- | --- |
+| PowerShell | this window | `$env:MODIO_API_KEY = "your_key"` |
+| PowerShell | permanent | `[Environment]::SetEnvironmentVariable("MODIO_API_KEY", "your_key", "User")` |
+| Command Prompt | this window | `set MODIO_API_KEY=your_key` |
+| Command Prompt | permanent | `setx MODIO_API_KEY "your_key"` |
+| bash or zsh | this shell | `export MODIO_API_KEY=your_key` |
+| bash or zsh | permanent | add that `export` line to `~/.bashrc`, `~/.zshrc` or `~/.profile` |
+| fish | permanent | `set -Ux MODIO_API_KEY your_key` |
+| any | one command | `MODIO_API_KEY=your_key cargo build --release` |
+
+Two things that catch people out. `setx` does not affect the window you run it
+in, only ones opened afterwards. And the permanent options are visible to every
+program you run, not just this one, which is a reason to prefer the config file.
+
+For CI, none of the above applies: the workflows read a repository secret named
+`MODIO_API_KEY`, set under Settings, Secrets and variables, Actions. Dependabot
+pull requests read from the separate Dependabot scope on that same page.
 
 ### Where Builds Go
 
