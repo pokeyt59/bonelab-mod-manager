@@ -178,8 +178,13 @@ runs the result never has to supply one:
 MODIO_API_KEY=your_key cargo build --release
 ```
 
-Building without a key is fine too. The executable then asks for `MODIO_API_KEY`
-in the environment at run time instead, and says so plainly if it is missing.
+Building **without** a key does not work, on purpose. It would produce an
+executable that cannot reach mod.io at all and would only say so once somebody
+ran it, so the build stops and tells you where to get one instead. An empty key
+is refused for the same reason, which is the shape an unset CI secret arrives
+in.
+
+This applies to `cargo test` too, since the tests build the same crate.
 
 Wherever you put your key, it should not end up in the repository.
 `.cargo/config.toml` is in `.gitignore` for exactly that reason, so a key kept

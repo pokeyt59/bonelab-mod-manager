@@ -18,25 +18,30 @@ use crate::BONELAB_GAME_ID;
 /// Supplies a mod.io token without going through the interactive prompt.
 const TOKEN_VAR: &str = "BMM_MODIO_TOKEN";
 
-const API_KEY_VAR: &str = "MODIO_API_KEY";
+/// The mod.io API key, read from the environment while the program is built.
+///
+/// Required rather than optional. Without it the program cannot reach mod.io at
+/// all, and nothing would say so until somebody ran it, so the build stops here
+/// instead of shipping something broken.
+const API_KEY: &str = env!(
+    "MODIO_API_KEY",
+    "no mod.io API key to build with.\n\
+     Get one free at https://mod.io/me/access, then build with \
+     MODIO_API_KEY=your_key cargo build --release\n\
+     See Building From Source in the README for other ways to set it."
+);
 
-/// The key baked in at build time, falling back to the environment so the
-/// program can be built and run without a release key on hand.
-fn api_key() -> Result<String> {
-    if let Some(key) = option_env!("MODIO_API_KEY").filter(|key| !key.is_empty()) {
-        return Ok(key.to_string());
-    }
+// An unset secret in CI arrives as an empty string rather than as nothing at
+// all, which would otherwise sail past `env!` and only fail once someone ran it.
+const _: () = assert!(
+    !API_KEY.is_empty(),
+    "MODIO_API_KEY is set, but to an empty value.\n\
+     Get a key free at https://mod.io/me/access.\n\
+     See Building From Source in the README."
+);
 
-    env::var(API_KEY_VAR).map_err(|_| {
-        anyhow!(
-            "This build has no mod.io API key compiled in, so {API_KEY_VAR} must be set. \
-             Generate a key at https://mod.io/me/access"
-        )
-    })
-}
-
-fn builder(target_platform: TargetPlatform) -> Result<Builder> {
-    Ok(Client::builder(api_key()?)
+fn builder(target_platform: TargetPlatform) -> Builder {
+    Client::builder(API_KEY.to_string())
         // Load bearing, not decoration: mod.io answers a request with no user
         // agent with a 404 telling you the domain is deprecated.
         .user_agent(concat!(
@@ -49,7 +54,7 @@ fn builder(target_platform: TargetPlatform) -> Result<Builder> {
         .game_host(GameId::new(BONELAB_GAME_ID))
         // Tells mod.io which platform's mod files this install can actually
         // load, so it filters and resolves files for us.
-        .target_platform(target_platform))
+        .target_platform(target_platform)
 }
 
 // Windows deliberately does not use the credential store. A mod.io token is
@@ -166,9 +171,7 @@ pub(super) async fn authenticate(
     target_platform: TargetPlatform,
     can_change_platform: bool,
 ) -> Result<Authentication> {
-    // Built up front so a missing API key is reported before the user is asked
-    // to go and fetch an email code.
-    let builder = builder(target_platform)?;
+    let builder = builder(target_platform);
 
     if let Ok(token) = env::var(TOKEN_VAR) {
         debug!("got token from {TOKEN_VAR}");

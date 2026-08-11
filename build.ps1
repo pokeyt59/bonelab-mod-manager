@@ -19,11 +19,15 @@ param([switch]$DebugBuild)
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
 
-# The key is compiled in by `option_env!` and cargo tracks it, so building
-# without it silently produces a binary that cannot talk to mod.io at all.
+# The build refuses to proceed without a key anyway. Saying so here saves
+# compiling every dependency first only to stop at the last crate.
 if (-not $env:MODIO_API_KEY -and -not (Test-Path '.cargo\config.toml')) {
-    Write-Warning 'No MODIO_API_KEY set and no .cargo\config.toml to supply one.'
-    Write-Warning 'The result will have no mod.io API key compiled in and will not work.'
+    Write-Host 'No mod.io API key, and the build needs one.' -ForegroundColor Red
+    Write-Host 'Get one free at https://mod.io/me/access, then either:'
+    Write-Host '    $env:MODIO_API_KEY = "your_key"'
+    Write-Host 'or put it in .cargo\config.toml. See Building From Source in the README.'
+
+    exit 1
 }
 
 if ($DebugBuild) {

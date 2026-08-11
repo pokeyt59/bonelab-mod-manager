@@ -21,11 +21,15 @@ if [ "${1-}" = "--debug" ]; then
     cargo_args=(build)
 fi
 
-# The key is compiled in by `option_env!` and cargo tracks it, so building
-# without it silently produces a binary that cannot talk to mod.io at all.
+# The build refuses to proceed without a key anyway. Saying so here saves
+# compiling every dependency first only to stop at the last crate.
 if [ -z "${MODIO_API_KEY-}" ] && [ ! -f .cargo/config.toml ]; then
-    echo "warning: no MODIO_API_KEY set and no .cargo/config.toml to supply one." >&2
-    echo "warning: the result will have no mod.io API key compiled in." >&2
+    echo "No mod.io API key, and the build needs one." >&2
+    echo "Get one free at https://mod.io/me/access, then either:" >&2
+    echo "    export MODIO_API_KEY=your_key" >&2
+    echo "or put it in .cargo/config.toml. See Building From Source in the README." >&2
+
+    exit 1
 fi
 
 case "$(uname -s)" in
