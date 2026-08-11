@@ -27,20 +27,23 @@ const PLATFORM_VAR: &str = "BMM_PLATFORM";
 
 #[derive(Serialize, Deserialize, Default)]
 pub(crate) struct AppData {
-    /// Where Windows builds used to keep the mod.io token, before it moved into
-    /// the credential store.
+    /// The mod.io token, encrypted for the current Windows user.
     ///
-    /// Kept so an existing install can be migrated, and because dropping it
-    /// would change the on disk layout and lose the record of what is
-    /// installed, forcing every mod to be downloaded again.
+    /// Bytes rather than text because the encrypted form is not valid UTF-8.
+    /// Widening the type did not change the on disk layout, since postcard
+    /// writes a `String` and a `Vec<u8>` the same way, as a length followed by
+    /// that many bytes, so files written when the token was plain text still
+    /// load. That matters: [`AppData::read`] resets anything it cannot
+    /// deserialize, which would throw away every installed mod record and
+    /// download the lot again. `authentication` owns what the bytes mean.
     #[cfg(target_os = "windows")]
-    pub(crate) modio_token: Option<String>,
+    pub(crate) modio_token: Option<Vec<u8>>,
     #[cfg(target_os = "windows")]
     pub(crate) platform: Option<BonelabPlatform>,
     pub(crate) installed_mods: HashMap<u64, InstalledMod>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum BonelabPlatform {
     Windows,
     Quest,
@@ -236,5 +239,57 @@ impl AppData {
         debug!("wrote app data");
 
         Ok(())
+    }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod tests {
+    use super::*;
+
+    /// The shape written by builds from before the token was encrypted, when
+    /// `modio_token` was a `String`.
+    #[derive(Serialize)]
+    struct LegacyAppData {
+        modio_token: Option<String>,
+        platform: Option<BonelabPlatform>,
+        installed_mods: HashMap<u64, InstalledMod>,
+    }
+
+    /// Guards the one thing that makes encrypting the token safe to ship:
+    /// widening `modio_token` must not change the on disk layout. [`AppData
+    /// ::read`] silently resets whatever it cannot deserialize, so a layout
+    /// change would cost every existing user their record of what is installed
+    /// and re-download all of it, which for a full subscription list is gigabytes.
+    #[test]
+    fn app_data_written_before_the_token_was_encrypted_still_loads() {
+        let mut installed_mods = HashMap::new();
+
+        installed_mods.insert(
+            6297147,
+            InstalledMod {
+                date_updated: 1699999999,
+                folder: OsString::from("Aubies12.Bean"),
+            },
+        );
+
+        let legacy = LegacyAppData {
+            modio_token: Some("a.plain.text.token".to_string()),
+            platform: Some(BonelabPlatform::Quest),
+            installed_mods,
+        };
+        let read: AppData = postcard::from_bytes(&postcard::to_stdvec(&legacy).unwrap())
+            .expect("app data from an older build no longer deserializes");
+
+        assert_eq!(
+            read.modio_token.as_deref(),
+            Some(&b"a.plain.text.token"[..]),
+            "the old token did not survive as bytes",
+        );
+        assert_eq!(read.platform, Some(BonelabPlatform::Quest));
+        assert_eq!(
+            read.installed_mods.get(&6297147).map(|m| &m.folder),
+            Some(&OsString::from("Aubies12.Bean")),
+            "the record of installed mods was lost",
+        );
     }
 }

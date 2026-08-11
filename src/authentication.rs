@@ -55,7 +55,45 @@ fn builder(target_platform: TargetPlatform) -> Result<Builder> {
 // Windows deliberately does not use the credential store. A mod.io token is
 // around 1800 characters, and Windows Credential Manager caps a credential at
 // 2560 bytes once the value is encoded as UTF-16, so storing one there fails
-// outright. See `keyring_cannot_hold_a_modio_token_on_windows`.
+// outright. See `keyring_cannot_hold_a_modio_token_on_windows`. It goes in the
+// app data file encrypted with the data protection API instead, which has no
+// such limit because the file is ours.
+
+/// Marks a stored token as encrypted.
+///
+/// Builds from before the token was encrypted wrote it as plain text, and the
+/// leading NUL, which no token can begin with, is what tells the two apart.
+#[cfg(target_os = "windows")]
+const ENCRYPTED_MARKER: &[u8] = b"\0dpapi1\0";
+
+/// What was found in the app data.
+#[cfg(target_os = "windows")]
+enum StoredToken {
+    Encrypted(String),
+    /// Left in plain text by a build from before the token was encrypted, so it
+    /// wants storing again properly.
+    Legacy(String),
+}
+
+#[cfg(target_os = "windows")]
+fn decode_stored_token(stored: &[u8]) -> Result<StoredToken> {
+    let Some(ciphertext) = stored.strip_prefix(ENCRYPTED_MARKER) else {
+        return Ok(StoredToken::Legacy(String::from_utf8(stored.to_vec())?));
+    };
+
+    Ok(StoredToken::Encrypted(String::from_utf8(
+        crate::dpapi::unprotect(ciphertext)?,
+    )?))
+}
+
+#[cfg(target_os = "windows")]
+fn encode_token(token: &str) -> Result<Vec<u8>> {
+    let mut encoded = ENCRYPTED_MARKER.to_vec();
+
+    encoded.extend(crate::dpapi::protect(token.as_bytes())?);
+
+    Ok(encoded)
+}
 
 #[cfg(target_family = "unix")]
 fn entry() -> Result<Entry> {
@@ -70,10 +108,19 @@ async fn get_password() -> Result<String> {
 #[cfg(target_os = "windows")]
 async fn get_password() -> Result<String> {
     let app_data = AppData::read().await?;
-
-    app_data
+    let stored = app_data
         .modio_token
-        .ok_or(anyhow!("User does not have mod.io token"))
+        .ok_or(anyhow!("User does not have mod.io token"))?;
+
+    match decode_stored_token(&stored)? {
+        StoredToken::Encrypted(token) => Ok(token),
+        StoredToken::Legacy(token) => {
+            debug!("encrypting a token an older build left in plain text");
+            set_password(&token).await?;
+
+            Ok(token)
+        }
+    }
 }
 
 #[cfg(target_family = "unix")]
@@ -85,7 +132,7 @@ async fn set_password(password: &str) -> Result<()> {
 async fn set_password(password: &str) -> Result<()> {
     let mut app_data = AppData::read().await?;
 
-    app_data.modio_token = Some(password.to_string());
+    app_data.modio_token = Some(encode_token(password)?);
 
     app_data.write().await
 }
@@ -131,15 +178,19 @@ pub(super) async fn authenticate(
         )));
     }
 
-    if let Ok(token) = get_password().await {
-        debug!("got password");
+    // A stored token that will not decrypt, because the app data came from
+    // another account or machine, is not an error worth stopping for: the user
+    // simply signs in again. Worth saying why in the log, though.
+    match get_password().await {
+        Ok(token) => {
+            debug!("got password");
 
-        return Ok(Authentication::SignedIn(Arc::new(
-            builder.token(token).build()?,
-        )));
+            return Ok(Authentication::SignedIn(Arc::new(
+                builder.token(token).build()?,
+            )));
+        }
+        Err(err) => debug!("could not get password: {err:#}"),
     }
-
-    debug!("could not get password");
 
     let client = builder.build()?;
 
@@ -206,10 +257,69 @@ pub(super) async fn authenticate(
 mod tests {
     use keyring::Entry;
 
+    #[cfg(target_os = "windows")]
+    use super::{decode_stored_token, encode_token, StoredToken, ENCRYPTED_MARKER};
+
     /// Roughly the length of a token mod.io issues.
     const TOKEN_LEN: usize = 1822;
 
     const PROBE_SERVICE: &str = "bonelab_mod_manager_probe";
+
+    /// Nothing readable should reach the app data file, at the length that
+    /// actually matters.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn a_stored_token_is_encrypted_and_comes_back_intact() {
+        let token = "ey".to_string() + &"J".repeat(TOKEN_LEN - 2);
+        let encoded = encode_token(&token).unwrap();
+
+        assert!(
+            encoded.starts_with(ENCRYPTED_MARKER),
+            "stored token is not marked as encrypted",
+        );
+        assert!(
+            !encoded
+                .windows(token.len())
+                .any(|window| window == token.as_bytes()),
+            "the token is sitting in the app data in the clear",
+        );
+
+        let StoredToken::Encrypted(decoded) = decode_stored_token(&encoded).unwrap() else {
+            panic!("an encrypted token was not recognised as one");
+        };
+
+        assert_eq!(decoded, token);
+    }
+
+    /// The upgrade path: whatever an older build wrote has to keep working, or
+    /// everyone gets signed out by the update.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn a_plain_text_token_is_read_and_flagged_for_encrypting() {
+        let StoredToken::Legacy(token) =
+            decode_stored_token(b"eyJhbGciOiJIUzI1.plain.text").unwrap()
+        else {
+            panic!("a plain text token was mistaken for an encrypted one");
+        };
+
+        assert_eq!(token, "eyJhbGciOiJIUzI1.plain.text");
+    }
+
+    /// App data carried to another machine, or corrupted, must report an error
+    /// so the caller can ask for a fresh sign in, rather than panicking.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn a_blob_that_will_not_decrypt_is_an_error() {
+        let mut encoded = encode_token("something worth protecting").unwrap();
+        let last = encoded.len() - 1;
+
+        encoded[last] ^= 0xff;
+
+        assert!(
+            decode_stored_token(&encoded).is_err(),
+            "a tampered blob was accepted",
+        );
+    }
 
     /// Documents why Windows keeps the token in the app data file rather than
     /// the credential store, so nobody "fixes" it back.

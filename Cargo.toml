@@ -31,6 +31,14 @@ zip = "8.6.0"
 [target.'cfg(unix)'.dependencies]
 keyring = "4.1.6"
 
+# For the data protection API, which is what Windows uses instead. Already in
+# the dependency tree by way of tokio, so this only turns features on.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+  "Win32_Foundation",
+  "Win32_Security_Cryptography",
+] }
+
 [dev-dependencies]
 tempfile = "3.27.0"
 

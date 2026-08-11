@@ -1,5 +1,7 @@
 mod app_data;
 mod authentication;
+#[cfg(target_os = "windows")]
+mod dpapi;
 mod installation;
 
 use std::{collections::HashSet, env, sync::Arc};

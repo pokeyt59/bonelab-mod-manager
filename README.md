@@ -110,17 +110,25 @@ executable and add ` --sign-out` to the end of the shortcut's Target field.
 
 | Platform | Location |
 | --- | --- |
-| Windows | `%AppData%\bonelab_mod_manager\app_data`, in plain text |
+| Windows | `%AppData%\bonelab_mod_manager\app_data`, encrypted for your Windows account |
 | macOS | Keychain, under `bonelab_mod_manager` |
 | Linux | Secret Service (GNOME Keyring or KWallet), under `bonelab_mod_manager` |
 
 Windows does not use Credential Manager for this. A mod.io token is around 1800
 characters, and Credential Manager refuses anything over 2560 bytes once the
-value is encoded as UTF-16.
+value is encoded as UTF-16. The token is encrypted with the Windows data
+protection API instead, which ties it to your Windows account, so the file is
+useless on another account, on another machine, or sitting in a backup. It is
+**not** protection against something already running as you, which can ask
+Windows to decrypt it exactly as this program does.
 
-That matters most if you play on Quest, because the staging folder you copy mods
-from, `%AppData%\bonelab_mod_manager\Mods`, sits right next to that file. Copy
-the `Mods` folder to your headset, not the folder containing it.
+An older install whose token is still in plain text is upgraded the first time
+it runs; you will not have to sign in again.
+
+If you play on Quest, the staging folder you copy mods from,
+`%AppData%\bonelab_mod_manager\Mods`, sits next to that file. Copying the `Mods`
+folder rather than the folder containing it is still the tidy thing to do, but
+your sign in is no longer readable if the file does travel.
 
 ## Mod Installation Paths
 
