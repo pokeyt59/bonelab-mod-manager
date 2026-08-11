@@ -1,6 +1,10 @@
 use std::{env, sync::Arc};
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{bail, Result};
+// Only the Windows token store has a missing token to report; the Unix one
+// leaves that to the keyring.
+#[cfg(target_os = "windows")]
+use anyhow::anyhow;
 use dialoguer::{theme::ColorfulTheme, Input, Password, Select};
 #[cfg(target_family = "unix")]
 use keyring::Entry;
