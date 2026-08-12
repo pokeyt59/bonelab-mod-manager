@@ -107,7 +107,55 @@ impl Display for BonelabPlatform {
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct InstalledMod {
     pub(crate) date_updated: u64,
-    pub(crate) folder: OsString,
+    /// Every folder this mod put in the Mods directory.
+    ///
+    /// Usually one. Some downloads are packs: several complete mods in a single
+    /// archive, each with its own pallet, which Bonelab loads independently. All
+    /// of them have to be recorded, or unsubscribing would leave the rest behind.
+    pub(crate) folders: Vec<OsString>,
+}
+
+/// The shape written before packs were supported, when a mod was one folder.
+///
+/// Kept so an existing install carries over rather than being reset, which would
+/// cost the record of every installed mod and download all of them again.
+#[derive(Deserialize)]
+struct LegacyAppData {
+    #[cfg(target_os = "windows")]
+    modio_token: Option<Vec<u8>>,
+    #[cfg(target_os = "windows")]
+    platform: Option<BonelabPlatform>,
+    installed_mods: HashMap<u64, LegacyInstalledMod>,
+}
+
+#[derive(Deserialize)]
+struct LegacyInstalledMod {
+    date_updated: u64,
+    folder: OsString,
+}
+
+impl From<LegacyAppData> for AppData {
+    fn from(legacy: LegacyAppData) -> Self {
+        Self {
+            #[cfg(target_os = "windows")]
+            modio_token: legacy.modio_token,
+            #[cfg(target_os = "windows")]
+            platform: legacy.platform,
+            installed_mods: legacy
+                .installed_mods
+                .into_iter()
+                .map(|(id, installed_mod)| {
+                    (
+                        id,
+                        InstalledMod {
+                            date_updated: installed_mod.date_updated,
+                            folders: vec![installed_mod.folder],
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
 }
 
 impl AppData {
@@ -208,22 +256,33 @@ impl AppData {
             return Self::write_default().await;
         }
 
-        // Anything that fails to deserialize is either corrupt or was written
-        // by a version with a different layout. Neither is worth failing over:
-        // the file is a cache of what's installed, and starting over just means
-        // mods get reinstalled once.
-        match postcard::from_bytes(&fs::read(path).await?) {
-            Ok(app_data) => {
-                debug!("read app data");
+        let bytes = fs::read(path).await?;
 
-                Ok(app_data)
-            }
-            Err(err) => {
-                debug!("app data is unreadable ({err}), resetting");
+        if let Ok(app_data) = postcard::from_bytes(&bytes) {
+            debug!("read app data");
 
-                Ok(Self::write_default().await?)
-            }
+            return Ok(app_data);
         }
+
+        // A file from before packs were supported reads as the older shape
+        // instead. Convert it rather than starting over, which would mean
+        // downloading every installed mod again.
+        if let Ok(legacy) = postcard::from_bytes::<LegacyAppData>(&bytes) {
+            debug!("converting app data from the layout used before mod packs");
+
+            let app_data = Self::from(legacy);
+
+            app_data.write().await?;
+
+            return Ok(app_data);
+        }
+
+        // Anything else is corrupt or from a layout nothing here knows. Not
+        // worth failing over: the file is a cache of what is installed, and
+        // starting over just means the mods get installed again once.
+        debug!("app data is unreadable, resetting");
+
+        Self::write_default().await
     }
 
     pub(crate) async fn write(&self) -> Result<()> {
@@ -246,50 +305,74 @@ impl AppData {
 mod tests {
     use super::*;
 
-    /// The shape written by builds from before the token was encrypted, when
-    /// `modio_token` was a `String`.
+    const A_MOD: u64 = 6297147;
+
+    /// Exactly what a build from before either change wrote: the token in plain
+    /// text, and one folder per mod.
     #[derive(Serialize)]
-    struct LegacyAppData {
+    struct OldestAppData {
         modio_token: Option<String>,
         platform: Option<BonelabPlatform>,
-        installed_mods: HashMap<u64, InstalledMod>,
+        installed_mods: HashMap<u64, OldestInstalledMod>,
     }
 
-    /// Guards the one thing that makes encrypting the token safe to ship:
-    /// widening `modio_token` must not change the on disk layout. [`AppData
-    /// ::read`] silently resets whatever it cannot deserialize, so a layout
-    /// change would cost every existing user their record of what is installed
-    /// and re-download all of it, which for a full subscription list is gigabytes.
-    #[test]
-    fn app_data_written_before_the_token_was_encrypted_still_loads() {
+    #[derive(Serialize)]
+    struct OldestInstalledMod {
+        date_updated: u64,
+        folder: OsString,
+    }
+
+    fn app_data_from_an_older_build() -> Vec<u8> {
         let mut installed_mods = HashMap::new();
 
         installed_mods.insert(
-            6297147,
-            InstalledMod {
+            A_MOD,
+            OldestInstalledMod {
                 date_updated: 1699999999,
                 folder: OsString::from("Aubies12.Bean"),
             },
         );
 
-        let legacy = LegacyAppData {
+        postcard::to_stdvec(&OldestAppData {
             modio_token: Some("a.plain.text.token".to_string()),
             platform: Some(BonelabPlatform::Quest),
             installed_mods,
-        };
-        let read: AppData = postcard::from_bytes(&postcard::to_stdvec(&legacy).unwrap())
-            .expect("app data from an older build no longer deserializes");
+        })
+        .unwrap()
+    }
+
+    /// [`AppData::read`] resets anything it cannot make sense of, which would
+    /// cost every existing user their record of what is installed and download
+    /// all of it again, gigabytes for a full subscription list. Supporting packs
+    /// did change the layout, so the old one has to be read and converted rather
+    /// than thrown away.
+    #[test]
+    fn app_data_from_before_packs_converts_instead_of_being_lost() {
+        let bytes = app_data_from_an_older_build();
+
+        assert!(
+            postcard::from_bytes::<AppData>(&bytes).is_err(),
+            "the old layout parsed as the current one, so `read` would never \
+             reach the conversion and would silently use whatever it decoded",
+        );
+
+        let converted = AppData::from(
+            postcard::from_bytes::<LegacyAppData>(&bytes)
+                .expect("app data from an older build can no longer be read at all"),
+        );
 
         assert_eq!(
-            read.modio_token.as_deref(),
+            converted.installed_mods[&A_MOD].folders,
+            vec![OsString::from("Aubies12.Bean")],
+            "the record of what is installed was lost",
+        );
+        assert_eq!(converted.platform, Some(BonelabPlatform::Quest));
+        // Widening the token to bytes deliberately did not change the layout, so
+        // a plain text one still arrives intact and can be encrypted in place.
+        assert_eq!(
+            converted.modio_token.as_deref(),
             Some(&b"a.plain.text.token"[..]),
             "the old token did not survive as bytes",
-        );
-        assert_eq!(read.platform, Some(BonelabPlatform::Quest));
-        assert_eq!(
-            read.installed_mods.get(&6297147).map(|m| &m.folder),
-            Some(&OsString::from("Aubies12.Bean")),
-            "the record of installed mods was lost",
         );
     }
 }

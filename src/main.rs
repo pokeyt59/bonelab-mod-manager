@@ -158,8 +158,8 @@ async fn try_main() -> Result<()> {
 
     for (installed_mod_id, installed_mod) in unsubscribed {
         debug!(
-            "removing installed mod with id `{installed_mod_id}` and folder \"{}\"",
-            installed_mod.folder.to_string_lossy(),
+            "removing installed mod with id `{installed_mod_id}` and {} folder(s)",
+            installed_mod.folders.len(),
         );
 
         remove_installed_mod(&mods_dir, &installed_mod).await?;

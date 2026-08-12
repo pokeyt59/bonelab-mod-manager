@@ -7,7 +7,7 @@ use std::{
     sync::Arc,
 };
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use console::Style;
 use indicatif::{style::TemplateError, ProgressBar, ProgressStyle};
 use log::debug;
@@ -197,25 +197,29 @@ pub(crate) async fn remove_installed_mod(
     mods_dir: &Path,
     installed_mod: &InstalledMod,
 ) -> Result<()> {
-    let path = mods_dir.join(&installed_mod.folder);
+    // A pack put down several folders and all of them have to go, or
+    // unsubscribing would leave most of it behind.
+    for folder in &installed_mod.folders {
+        let path = mods_dir.join(folder);
 
-    debug!("removing \"{}\"", path.display());
+        debug!("removing \"{}\"", path.display());
 
-    let metadata = match symlink_metadata(&path).await {
-        Ok(metadata) => metadata,
-        Err(err) if err.kind() == ErrorKind::NotFound => {
-            debug!("nothing to remove");
+        let metadata = match symlink_metadata(&path).await {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                debug!("nothing to remove");
 
-            return Ok(());
+                continue;
+            }
+            Err(err) => return Err(err.into()),
+        };
+
+        // Content mods are directories; code mods are a single `.dll`.
+        if metadata.is_dir() {
+            remove_dir_all(&path).await?;
+        } else {
+            remove_file(&path).await?;
         }
-        Err(err) => return Err(err.into()),
-    };
-
-    // Content mods are directories; code mods are a single `.dll`.
-    if metadata.is_dir() {
-        remove_dir_all(&path).await?;
-    } else {
-        remove_file(&path).await?;
     }
 
     Ok(())
@@ -225,8 +229,11 @@ pub(crate) async fn remove_installed_mod(
 ///
 /// Mods are published per platform and the builds genuinely differ, so handing
 /// a Quest user the Windows file would give them something Bonelab cannot load.
-/// `modfile` is only a fallback: the client sends a target platform header, so
-/// mod.io has already resolved that field for this platform.
+///
+/// `modfile` is only a fallback, and a poor one: mod.io fills it in with the
+/// most recent upload regardless of the target platform header, so it is quite
+/// capable of naming an Android build for a Windows install. It is used anyway
+/// because the alternative is refusing a mod that lists no platforms at all.
 fn file_id_for(r#mod: &Mod, target_platform: TargetPlatform) -> Result<FileId> {
     r#mod
         .platforms
@@ -299,8 +306,17 @@ async fn _install_mod(
 
             // The record is only a cache of what is on disk, so a mod that has
             // since been deleted by hand needs laying down again however recent
-            // the record claims it is.
-            let present = try_exists(mods_dir.join(&installed_mod.folder)).await?;
+            // the record claims it is. A pack counts as present only if all of
+            // its folders are, since a half deleted pack is still incomplete.
+            let mut present = !installed_mod.folders.is_empty();
+
+            for folder in &installed_mod.folders {
+                if !try_exists(mods_dir.join(folder)).await? {
+                    present = false;
+
+                    break;
+                }
+            }
 
             if present && installed_mod.date_updated >= date_updated {
                 return Ok(ModInstallationOutcome::AlreadyInstalled);
@@ -355,13 +371,13 @@ async fn _install_mod(
         remove_installed_mod(&mods_dir, installed_mod).await?;
     }
 
-    let folder = spawn_blocking(move || extract_mod(bytes, &mods_dir)).await??;
+    let folders = spawn_blocking(move || extract_mod(bytes, &mods_dir)).await??;
 
-    debug!("extracted mod file");
+    debug!("extracted mod file into {} folder(s)", folders.len());
 
     let installed_mod = InstalledMod {
         date_updated,
-        folder,
+        folders,
     };
 
     Ok(if updating {
@@ -371,23 +387,71 @@ async fn _install_mod(
     })
 }
 
-/// Unpacks a mod archive into `mods_dir` and reports the folder it created.
+/// Unpacks a mod archive into `mods_dir` and reports the folders it created.
 ///
-/// Bonelab loads a mod from a single `Author.ModName` directory holding a
-/// pallet manifest, named either `pallet.json` or after the mod itself, so an
-/// archive without exactly one root directory would scatter its contents across
-/// the Mods folder. Rejecting it before extracting leaves the Mods folder
-/// untouched.
-fn extract_mod(bytes: Vec<u8>, mods_dir: &Path) -> Result<OsString> {
+/// Bonelab loads a mod from an `Author.ModName` directory holding a pallet
+/// manifest, named either `pallet.json` or after the mod itself. An archive may
+/// hold several such directories, a pack of mods published as one download, and
+/// all of them get installed. What it may not do is leave files loose at the
+/// root, which would scatter them across the Mods folder; that is checked before
+/// extracting anything, so a bad archive leaves the Mods folder untouched.
+fn extract_mod(bytes: Vec<u8>, mods_dir: &Path) -> Result<Vec<OsString>> {
     let mut archive = ZipArchive::new(Cursor::new(bytes))?;
-    let root_dir = archive.root_dir(root_dir_common_filter)?.ok_or(anyhow!(
-        "Mod file archive does not contain exactly one root folder, \
-         so it is not laid out the way Bonelab expects"
-    ))?;
+    let folders = root_folders(&mut archive)?;
 
     archive.extract(mods_dir)?;
 
-    Ok(root_dir.into_os_string())
+    Ok(folders)
+}
+
+/// The top level folders an archive will extract into.
+///
+/// Usually one. A pack is several, each a complete mod with its own pallet,
+/// which Bonelab loads independently, so all of them are the mod as far as
+/// installing and removing are concerned.
+fn root_folders(archive: &mut ZipArchive<Cursor<Vec<u8>>>) -> Result<Vec<OsString>> {
+    let mut folders: Vec<OsString> = Vec::new();
+
+    for index in 0..archive.len() {
+        let file = archive.by_index(index)?;
+        let path = file
+            .enclosed_name()
+            .ok_or(anyhow!("Mod file archive contains an unsafe path"))?;
+
+        // Skips the likes of `__MACOSX` and `.DS_Store`, which are not part of
+        // the mod and would otherwise look like folders of their own.
+        if !root_dir_common_filter(&path) {
+            continue;
+        }
+
+        let mut components = path.components();
+        let Some(first) = components.next() else {
+            continue;
+        };
+
+        // A file at the root would land loose in the Mods folder rather than
+        // inside a mod, so Bonelab would not load it and it would be a nuisance
+        // to clean up.
+        if components.next().is_none() && !file.is_dir() {
+            bail!(
+                "Mod file archive has \"{}\" loose at its root instead of inside a mod folder, \
+                 so it is not laid out the way Bonelab expects",
+                path.display(),
+            );
+        }
+
+        let folder = first.as_os_str().to_os_string();
+
+        if !folders.contains(&folder) {
+            folders.push(folder);
+        }
+    }
+
+    if folders.is_empty() {
+        bail!("Mod file archive has nothing in it that Bonelab could load");
+    }
+
+    Ok(folders)
 }
 
 #[cfg(test)]
@@ -408,17 +472,27 @@ mod tests {
 
     use super::{
         _install_mod, extract_mod, file_id_for, Cursor, InstalledMod, Mod, ModInstallation,
-        ModInstallationOutcome, Path,
+        ModInstallationOutcome, OsString, Path,
     };
 
     /// A small mod whose Windows and Android files have different ids, so
     /// picking the wrong platform's file would fetch different bytes.
     const LIVE_MOD_ID: u64 = 6297147;
 
+    /// A name ending in a slash becomes a directory entry, which real archives
+    /// carry and which must not be mistaken for a file loose at the root.
     fn archive(entries: &[&str]) -> Vec<u8> {
         let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
 
         for entry in entries {
+            if let Some(dir) = entry.strip_suffix('/') {
+                writer
+                    .add_directory(dir, SimpleFileOptions::default())
+                    .unwrap();
+
+                continue;
+            }
+
             writer
                 .start_file(*entry, SimpleFileOptions::default())
                 .unwrap();
@@ -436,9 +510,9 @@ mod tests {
             "Author.ModName/data/thing.bin",
         ]);
 
-        let folder = extract_mod(bytes, dir.path()).unwrap();
+        let folders = extract_mod(bytes, dir.path()).unwrap();
 
-        assert_eq!(folder.to_str(), Some("Author.ModName"));
+        assert_eq!(folders, vec![OsString::from("Author.ModName")]);
         assert!(dir
             .path()
             .join("Author.ModName")
@@ -446,13 +520,53 @@ mod tests {
             .exists());
     }
 
+    /// Some downloads are packs: several complete mods in one archive, each
+    /// with its own pallet. Bonelab loads them independently, so all of them
+    /// are installed and all of them are recorded.
     #[test]
-    fn rejects_an_archive_with_several_root_folders() {
+    fn installs_every_mod_in_a_pack() {
         let dir = tempfile::tempdir().unwrap();
-        let bytes = archive(&["One.Mod/pallet.json", "Two.Mod/pallet.json"]);
+        let bytes = archive(&[
+            "BamBaeYoh.ZombieWeapons/",
+            "BamBaeYoh.ZombieWeapons/pallet.json",
+            "Pulvox.Dempsy/",
+            "Pulvox.Dempsy/pallet.json",
+            "Pulvox.Nikolai/",
+            "Pulvox.Nikolai/pallet.json",
+        ]);
 
-        assert!(extract_mod(bytes, dir.path()).is_err());
-        assert!(!dir.path().join("One.Mod").exists());
+        let folders = extract_mod(bytes, dir.path()).unwrap();
+
+        assert_eq!(
+            folders,
+            vec![
+                OsString::from("BamBaeYoh.ZombieWeapons"),
+                OsString::from("Pulvox.Dempsy"),
+                OsString::from("Pulvox.Nikolai"),
+            ],
+        );
+
+        for folder in &folders {
+            assert!(
+                dir.path().join(folder).join("pallet.json").exists(),
+                "{folder:?} did not make it out of the archive",
+            );
+        }
+    }
+
+    /// Junk a packaging tool left behind is not a mod, and counting it as one
+    /// would leave an empty folder in the Mods directory forever.
+    #[test]
+    fn ignores_archive_junk_when_working_out_the_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = archive(&[
+            "Author.ModName/pallet.json",
+            "__MACOSX/Author.ModName/._pallet.json",
+        ]);
+
+        let folders = extract_mod(bytes, dir.path()).unwrap();
+
+        assert_eq!(folders, vec![OsString::from("Author.ModName")]);
     }
 
     #[test]
@@ -565,7 +679,7 @@ mod tests {
 
         assert_eq!(mod_id.get(), LIVE_MOD_ID);
 
-        let folder = dir.path().join(&installed_mod.folder);
+        let folder = dir.path().join(&installed_mod.folders[0]);
 
         assert!(folder.is_dir(), "{} is not a directory", folder.display());
         assert!(
@@ -593,7 +707,7 @@ mod tests {
         // again, rather than skip it.
         let stale = InstalledMod {
             date_updated: installed_mod.date_updated - 1,
-            folder: installed_mod.folder.clone(),
+            folders: installed_mod.folders.clone(),
         };
         let ModInstallationOutcome::Updated(_, updated) =
             install_live_mod(&client, TargetPlatform::WINDOWS, dir.path(), Some(stale)).await
@@ -601,9 +715,9 @@ mod tests {
             panic!("expected an update");
         };
 
-        assert_eq!(updated.folder, installed_mod.folder);
+        assert_eq!(updated.folders, installed_mod.folders);
         assert!(
-            has_pallet(&dir.path().join(&updated.folder)),
+            has_pallet(&dir.path().join(&updated.folders[0])),
             "update left the mod folder incomplete",
         );
 
@@ -623,7 +737,7 @@ mod tests {
         };
 
         assert!(
-            has_pallet(&dir.path().join(&reinstalled.folder)),
+            has_pallet(&dir.path().join(&reinstalled.folders[0])),
             "reinstall left the mod folder incomplete",
         );
     }
@@ -668,7 +782,7 @@ mod tests {
             };
 
             assert!(
-                has_pallet(&dir.path().join(&installed_mod.folder)),
+                has_pallet(&dir.path().join(&installed_mod.folders[0])),
                 "the {target_platform} install left the mod folder incomplete",
             );
         }
