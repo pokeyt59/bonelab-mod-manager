@@ -244,6 +244,38 @@ fn file_id_for(r#mod: &Mod, target_platform: TargetPlatform) -> Result<FileId> {
         .ok_or(anyhow!("Mod does not have a {target_platform} mod file"))
 }
 
+/// Turns a failure into something worth reading.
+///
+/// Most of these need no help, but a raw HTTP status does not tell anyone what
+/// went wrong or whether it is their problem. The common one is a mod that is
+/// still in someone's subscriptions after its author hid or removed it:
+/// subscriptions survive that, downloads do not.
+fn explain(err: &anyhow::Error) -> String {
+    // Downloading wraps the mod.io error in one of its own, so the interesting
+    // one is somewhere down the chain rather than at the top.
+    let Some(modio_err) = err
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<modio::Error>())
+    else {
+        return format!("{err:#}");
+    };
+
+    if modio_err.is_ratelimited() {
+        return "mod.io is rate limiting this account. Try again in a while, or set \
+                BMM_CONCURRENT_DOWNLOADS lower."
+            .to_string();
+    }
+
+    match modio_err.status().map(|status| status.as_u16()) {
+        Some(403 | 404) => {
+            "no longer available to download. Its author has probably hidden or removed it, \
+             which does not unsubscribe you. Unsubscribe on mod.io to stop it being retried."
+                .to_string()
+        }
+        _ => format!("{err:#}"),
+    }
+}
+
 pub(crate) async fn install_mod(
     r#mod: Mod,
     progress_bar: ProgressBar,
@@ -271,7 +303,7 @@ pub(crate) async fn install_mod(
             Ok(outcome)
         }
         Err(err) => {
-            let mut msg = format!("{err:#}");
+            let mut msg = explain(&err);
 
             if let Ok(backtrace) = env::var("RUST_BACKTRACE") {
                 if backtrace == "1" {
@@ -471,8 +503,8 @@ mod tests {
     use crate::BONELAB_GAME_ID;
 
     use super::{
-        _install_mod, extract_mod, file_id_for, Cursor, InstalledMod, Mod, ModInstallation,
-        ModInstallationOutcome, OsString, Path,
+        _install_mod, explain, extract_mod, file_id_for, Cursor, Download, DownloadAction, FileId,
+        InstalledMod, Mod, ModInstallation, ModInstallationOutcome, OsString, Path,
     };
 
     /// A small mod whose Windows and Android files have different ids, so
@@ -739,6 +771,33 @@ mod tests {
         assert!(
             has_pallet(&dir.path().join(&reinstalled.folders[0])),
             "reinstall left the mod folder incomplete",
+        );
+    }
+
+    /// A mod.io refusal has to still be recognisable as one after going through
+    /// `anyhow`, or the friendly wording never appears and people see a bare
+    /// HTTP status for something that is not their fault.
+    #[tokio::test]
+    #[ignore = "hits the live mod.io API"]
+    async fn explains_a_mod_that_cannot_be_downloaded() {
+        let client = live_client(TargetPlatform::WINDOWS);
+        // A file id that does not belong to this mod, which mod.io turns down
+        // the same way it turns down one whose mod has been hidden.
+        let err: anyhow::Error = client
+            .download(DownloadAction::File {
+                game_id: GameId::new(BONELAB_GAME_ID),
+                mod_id: ModId::new(LIVE_MOD_ID),
+                file_id: FileId::new(1),
+            })
+            .chunked()
+            .await
+            .expect_err("mod.io accepted a file id belonging to another mod")
+            .into();
+
+        assert!(
+            explain(&err).contains("no longer available to download"),
+            "a refusal was reported as {:?} instead of being explained",
+            explain(&err),
         );
     }
 
