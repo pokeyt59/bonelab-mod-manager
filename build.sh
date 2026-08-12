@@ -44,7 +44,17 @@ destination="BUILT/$operating_system"
 output="$destination/Bonelab-Mod-Manager$suffix"
 
 mkdir -p "$destination"
-cp "target/$profile_dir/bonelab_mod_manager$suffix" "$output"
+
+# Windows will not let a running executable be replaced, and says so in a way
+# that makes a successful build look like a failed one.
+if ! cp "target/$profile_dir/bonelab_mod_manager$suffix" "$output"; then
+    echo >&2
+    echo "The build worked, but $output could not be replaced." >&2
+    echo "That usually means it is still running. Close it and run this again." >&2
+    echo "The new executable is at target/$profile_dir/bonelab_mod_manager$suffix." >&2
+
+    exit 1
+fi
 
 echo
 echo "Built $profile_dir -> $output"

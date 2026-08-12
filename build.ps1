@@ -44,7 +44,19 @@ $destination = Join-Path 'BUILT' 'WINDOWS'
 $output = Join-Path $destination 'Bonelab-Mod-Manager.exe'
 
 New-Item -ItemType Directory -Force -Path $destination | Out-Null
-Copy-Item "target\$profileDir\bonelab_mod_manager.exe" $output -Force
+
+# Windows will not let a running executable be replaced, and the error it gives
+# says nothing about why, so a build that succeeded would appear to have failed.
+try {
+    Copy-Item "target\$profileDir\bonelab_mod_manager.exe" $output -Force -ErrorAction Stop
+} catch {
+    Write-Host ''
+    Write-Host "The build worked, but $output could not be replaced." -ForegroundColor Red
+    Write-Host 'That usually means it is still running. Close it and run this again.'
+    Write-Host "The new executable is at target\$profileDir\bonelab_mod_manager.exe."
+
+    exit 1
+}
 
 Write-Host ''
 Write-Host "Built $profileDir -> $(Resolve-Path $output)"
