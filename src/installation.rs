@@ -1,6 +1,6 @@
 use std::{
     env,
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     fmt,
     io::{Cursor, ErrorKind},
     path::{Path, PathBuf},
@@ -427,7 +427,8 @@ async fn _install_mod(
     }
 
     let installed =
-        spawn_blocking(move || extract_mod(bytes, &mods_dir, game_dir.as_deref())).await??;
+        spawn_blocking(move || extract_mod(bytes, &mods_dir, game_dir.as_deref(), target_platform))
+            .await??;
 
     debug!(
         "extracted {} folder(s) and {} file(s) beside the game",
@@ -470,66 +471,144 @@ pub(crate) struct Installed {
 /// a Thunderstore manifest, is packaging rather than the mod.
 const GAME_DIRS: [&str; 3] = ["Mods", "Plugins", "UserData"];
 
-fn extract_mod(bytes: Vec<u8>, mods_dir: &Path, game_dir: Option<&Path>) -> Result<Installed> {
+fn extract_mod(
+    bytes: Vec<u8>,
+    mods_dir: &Path,
+    game_dir: Option<&Path>,
+    target_platform: TargetPlatform,
+) -> Result<Installed> {
     let mut archive = ZipArchive::new(Cursor::new(bytes))?;
+    let folders = pallet_folders(&mut archive, target_platform)?;
 
-    // Bonelab loads a mod from a folder holding a pallet. Anything with no
-    // pallet anywhere in it, but with an assembly, is a code mod instead, which
-    // Bonelab never looks at and MelonLoader loads from the game directory.
-    if !has_pallet(&mut archive)? {
+    // Nothing holding a pallet means this is not content at all. A code mod is
+    // an assembly MelonLoader loads from the game directory, which Bonelab
+    // never looks at.
+    if folders.is_empty() {
         return extract_code_mod(&mut archive, game_dir);
     }
 
-    let folders = root_folders(&mut archive)?;
-
-    archive.extract(mods_dir)?;
+    for (source, name) in &folders {
+        extract_folder(&mut archive, source, &mods_dir.join(name))?;
+    }
 
     Ok(Installed {
-        folders,
+        folders: folders.into_iter().map(|(_, name)| name).collect(),
         game_files: Vec::new(),
     })
 }
 
-fn has_pallet(archive: &mut ZipArchive<Cursor<Vec<u8>>>) -> Result<bool> {
+/// Every directory in an archive that holds a pallet, and the name it should
+/// have once installed.
+///
+/// Bonelab only looks one level into its Mods directory, so where the pallet
+/// sits in the archive and where it has to end up are different questions. Some
+/// downloads are packs, several mods side by side. Others wrap the mod in an
+/// extra folder, often to offer a PC and a Quest copy in one file, and those
+/// have to be lifted out of the wrapper or the game never sees them. Keying off
+/// the pallet rather than the layout covers both without caring about depth.
+fn pallet_folders(
+    archive: &mut ZipArchive<Cursor<Vec<u8>>>,
+    target_platform: TargetPlatform,
+) -> Result<Vec<(PathBuf, OsString)>> {
+    let mut holding_a_pallet: Vec<PathBuf> = Vec::new();
+
     for index in 0..archive.len() {
         let file = archive.by_index(index)?;
-        let Some(path) = file.enclosed_name() else {
+        let path = file
+            .enclosed_name()
+            .ok_or(anyhow!("Mod file archive contains an unsafe path"))?;
+
+        // Skips the likes of `__MACOSX` and `.DS_Store`, which are not part of
+        // the mod and would otherwise look like a mod of their own.
+        if !root_dir_common_filter(&path) {
             continue;
-        };
+        }
+
         let Some(name) = path.file_name().map(|name| name.to_string_lossy()) else {
             continue;
         };
 
         // Mods in the wild use either a plain `pallet.json` or one named after
         // the mod, like `Aubies12.Bean.pallet.json`.
-        if name == "pallet.json" || name.ends_with(".pallet.json") {
-            return Ok(true);
+        if name != "pallet.json" && !name.ends_with(".pallet.json") {
+            continue;
+        }
+
+        // A pallet at the very root has no folder to become, and extracting it
+        // would scatter the mod across the Mods directory.
+        let directory = path
+            .parent()
+            .filter(|parent| parent.components().next().is_some())
+            .ok_or(anyhow!(
+                "Mod file archive has \"{}\" loose at its root instead of inside a mod folder,                  so it is not laid out the way Bonelab expects",
+                path.display(),
+            ))?
+            .to_path_buf();
+
+        if !holding_a_pallet.contains(&directory) {
+            holding_a_pallet.push(directory);
         }
     }
 
-    Ok(false)
+    // Dropping the copy meant for the other platform, unless that would leave
+    // nothing at all, which would mean the guess was wrong.
+    let wanted: Vec<_> = holding_a_pallet
+        .iter()
+        .filter(|path| !names_the_other_platform(path, target_platform))
+        .cloned()
+        .collect();
+    let holding_a_pallet = if wanted.is_empty() {
+        holding_a_pallet
+    } else {
+        wanted
+    };
+    let mut folders: Vec<(PathBuf, OsString)> = Vec::new();
+
+    for directory in holding_a_pallet {
+        let Some(name) = directory.file_name().map(OsStr::to_os_string) else {
+            continue;
+        };
+
+        // A PC and a Quest copy of one mod install to the same place, so only
+        // the first can win however the platform guess went.
+        if folders.iter().any(|(_, installed)| installed == &name) {
+            continue;
+        }
+
+        folders.push((directory, name));
+    }
+
+    Ok(folders)
 }
 
-/// Lays a code mod out beside the game the way MelonLoader expects to find it.
+/// Whether any part of a path names the platform being installed away from.
 ///
-/// Archives come both flat and wrapped in a folder named after the release, so
-/// placement keys off where `Mods`, `Plugins` or `UserData` appears in each
-/// path rather than off the depth it appears at. An assembly with none of those
-/// above it is treated as belonging in `Mods`, which is where a bare `.dll`
-/// download is meant to go.
-fn extract_code_mod(
-    archive: &mut ZipArchive<Cursor<Vec<u8>>>,
-    game_dir: Option<&Path>,
-) -> Result<Installed> {
-    let Some(game_dir) = game_dir else {
-        bail!(
-            "this is a code mod, which has to go beside the game rather than in the mods folder. \
-             Set BMM_GAME_DIR to the folder holding BONELAB_Steam_Windows64.exe to install it"
-        );
+/// Authors put a PC and a Quest build of the same mod in one download, in
+/// folders named for each, so the names are all there is to go on. Matching
+/// whole words keeps `PC` from being found inside an unrelated name.
+fn names_the_other_platform(path: &Path, target_platform: TargetPlatform) -> bool {
+    let other: &[&str] = if target_platform == TargetPlatform::WINDOWS {
+        &["quest", "android"]
+    } else {
+        &["pc", "pcvr", "windows"]
     };
 
-    let mut installed = Installed::default();
+    path.components().any(|component| {
+        component
+            .as_os_str()
+            .to_string_lossy()
+            .split(|character: char| !character.is_alphanumeric())
+            .any(|word| other.contains(&word.to_lowercase().as_str()))
+    })
+}
 
+/// Unpacks everything under `source` into `destination`, flattening away
+/// whatever the archive wrapped it in.
+fn extract_folder(
+    archive: &mut ZipArchive<Cursor<Vec<u8>>>,
+    source: &Path,
+    destination: &Path,
+) -> Result<()> {
     for index in 0..archive.len() {
         let mut file = archive.by_index(index)?;
 
@@ -540,25 +619,77 @@ fn extract_code_mod(
         let Some(path) = file.enclosed_name() else {
             bail!("Mod file archive contains an unsafe path");
         };
-        let Some(relative) = game_relative_path(&path) else {
-            debug!("skipping \"{}\", not part of the mod", path.display());
-
+        let Ok(within) = path.strip_prefix(source) else {
             continue;
         };
-        let destination = game_dir.join(&relative);
 
-        if let Some(parent) = destination.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
-        std::io::copy(&mut file, &mut std::fs::File::create(&destination)?)?;
-        debug!("wrote \"{}\"", destination.display());
-
-        installed.game_files.push(relative.into_os_string());
+        write_entry(&mut file, &destination.join(within))?;
     }
 
-    if installed.game_files.is_empty() {
-        bail!("Mod file archive has nothing in it that MelonLoader could load");
+    Ok(())
+}
+
+/// Writes one archive entry, making the directories above it first.
+fn write_entry(source: &mut impl std::io::Read, destination: &Path) -> Result<()> {
+    if let Some(parent) = destination.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    std::io::copy(source, &mut std::fs::File::create(destination)?)?;
+    debug!("wrote \"{}\"", destination.display());
+
+    Ok(())
+}
+
+/// Lays a code mod out beside the game the way MelonLoader expects to find it.
+///
+/// Archives come both flat and wrapped in a folder named after the release, so
+/// placement keys off where `Mods`, `Plugins` or `UserData` appears in each path
+/// rather than the depth it appears at. An assembly with none of those above it
+/// is taken to belong in `Mods`, which is where a bare `.dll` download goes.
+fn extract_code_mod(
+    archive: &mut ZipArchive<Cursor<Vec<u8>>>,
+    game_dir: Option<&Path>,
+) -> Result<Installed> {
+    let mut planned: Vec<(usize, PathBuf)> = Vec::new();
+
+    for index in 0..archive.len() {
+        let file = archive.by_index(index)?;
+
+        if file.is_dir() {
+            continue;
+        }
+
+        let Some(path) = file.enclosed_name() else {
+            bail!("Mod file archive contains an unsafe path");
+        };
+
+        match game_relative_path(&path) {
+            Some(relative) => planned.push((index, relative)),
+            None => debug!(
+                "skipping \"{}\", packaging rather than the mod",
+                path.display()
+            ),
+        }
+    }
+
+    // Worked out before the game directory is asked for, so an archive with
+    // nothing loadable in it is reported as that rather than as a missing
+    // setting the user would then go and set for no reason.
+    if planned.is_empty() {
+        bail!("Mod file archive has nothing in it that Bonelab or MelonLoader could load");
+    }
+
+    let Some(game_dir) = game_dir else {
+        bail!(
+            "this is a code mod, which goes beside the game rather than in the mods folder.              Set BMM_GAME_DIR to the folder holding BONELAB_Steam_Windows64.exe to install it"
+        );
+    };
+    let mut installed = Installed::default();
+
+    for (index, relative) in planned {
+        write_entry(&mut archive.by_index(index)?, &game_dir.join(&relative))?;
+        installed.game_files.push(relative.into_os_string());
     }
 
     Ok(installed)
@@ -580,56 +711,6 @@ fn game_relative_path(path: &Path) -> Option<PathBuf> {
     }
 
     None
-}
-
-/// The top level folders an archive will extract into.
-///
-/// Usually one. A pack is several, each a complete mod with its own pallet,
-/// which Bonelab loads independently, so all of them are the mod as far as
-/// installing and removing are concerned.
-fn root_folders(archive: &mut ZipArchive<Cursor<Vec<u8>>>) -> Result<Vec<OsString>> {
-    let mut folders: Vec<OsString> = Vec::new();
-
-    for index in 0..archive.len() {
-        let file = archive.by_index(index)?;
-        let path = file
-            .enclosed_name()
-            .ok_or(anyhow!("Mod file archive contains an unsafe path"))?;
-
-        // Skips the likes of `__MACOSX` and `.DS_Store`, which are not part of
-        // the mod and would otherwise look like folders of their own.
-        if !root_dir_common_filter(&path) {
-            continue;
-        }
-
-        let mut components = path.components();
-        let Some(first) = components.next() else {
-            continue;
-        };
-
-        // A file at the root would land loose in the Mods folder rather than
-        // inside a mod, so Bonelab would not load it and it would be a nuisance
-        // to clean up.
-        if components.next().is_none() && !file.is_dir() {
-            bail!(
-                "Mod file archive has \"{}\" loose at its root instead of inside a mod folder, \
-                 so it is not laid out the way Bonelab expects",
-                path.display(),
-            );
-        }
-
-        let folder = first.as_os_str().to_os_string();
-
-        if !folders.contains(&folder) {
-            folders.push(folder);
-        }
-    }
-
-    if folders.is_empty() {
-        bail!("Mod file archive has nothing in it that Bonelab could load");
-    }
-
-    Ok(folders)
 }
 
 #[cfg(test)]
@@ -688,7 +769,9 @@ mod tests {
             "Author.ModName/data/thing.bin",
         ]);
 
-        let folders = extract_mod(bytes, dir.path(), None).unwrap().folders;
+        let folders = extract_mod(bytes, dir.path(), None, TargetPlatform::WINDOWS)
+            .unwrap()
+            .folders;
 
         assert_eq!(folders, vec![OsString::from("Author.ModName")]);
         assert!(dir
@@ -713,7 +796,9 @@ mod tests {
             "Pulvox.Nikolai/pallet.json",
         ]);
 
-        let folders = extract_mod(bytes, dir.path(), None).unwrap().folders;
+        let folders = extract_mod(bytes, dir.path(), None, TargetPlatform::WINDOWS)
+            .unwrap()
+            .folders;
 
         assert_eq!(
             folders,
@@ -732,6 +817,95 @@ mod tests {
         }
     }
 
+    /// Authors wrap a mod in an extra folder, often named "OpenMe" or after the
+    /// platform. Bonelab only looks one level down, so a wrapped mod is invisible
+    /// to it and has to be lifted out.
+    #[test]
+    fn lifts_a_mod_out_of_the_folder_it_was_wrapped_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = archive(&[
+            "OpenMe/",
+            "OpenMe/Seikatsu.Rebecca1/pallet.json",
+            "OpenMe/Seikatsu.Rebecca1/data.bin",
+            "OpenMe/Seikatsu.Rebecca2/pallet.json",
+        ]);
+
+        let installed = extract_mod(bytes, dir.path(), None, TargetPlatform::WINDOWS).unwrap();
+
+        assert_eq!(
+            installed.folders,
+            vec![
+                OsString::from("Seikatsu.Rebecca1"),
+                OsString::from("Seikatsu.Rebecca2"),
+            ],
+        );
+        assert!(
+            !dir.path().join("OpenMe").exists(),
+            "the wrapper was installed instead of being flattened away",
+        );
+        assert!(dir
+            .path()
+            .join("Seikatsu.Rebecca1")
+            .join("pallet.json")
+            .exists());
+        assert!(dir
+            .path()
+            .join("Seikatsu.Rebecca1")
+            .join("data.bin")
+            .exists());
+        assert!(dir
+            .path()
+            .join("Seikatsu.Rebecca2")
+            .join("pallet.json")
+            .exists());
+    }
+
+    /// One download often carries both builds, in folders named for each. They
+    /// install to the same name, so taking both would leave whichever landed
+    /// last, which is a coin toss over whether the game can load it.
+    #[test]
+    fn takes_only_the_build_for_the_platform_being_installed() {
+        for (target, expected) in [
+            (TargetPlatform::WINDOWS, "pc"),
+            (TargetPlatform::ANDROID, "quest"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let bytes = archive(&[
+                "PC [OPEN]/RRRyu.Kobeni/pallet.json",
+                "PC [OPEN]/RRRyu.Kobeni/which.txt",
+                "Quest [OPEN]/RRRyu.Kobeni/pallet.json",
+                "Quest [OPEN]/RRRyu.Kobeni/which.txt",
+            ]);
+
+            let installed = extract_mod(bytes, dir.path(), None, target).unwrap();
+
+            assert_eq!(
+                installed.folders,
+                vec![OsString::from("RRRyu.Kobeni")],
+                "{expected}: both builds were installed under the same name",
+            );
+            assert!(dir.path().join("RRRyu.Kobeni").join("pallet.json").exists());
+        }
+    }
+
+    /// Guessing by name is only a guess. An archive whose only copy happens to
+    /// mention the other platform still has to install, since mod.io already
+    /// served the file for this one.
+    #[test]
+    fn installs_a_lone_build_even_if_its_name_mentions_the_other_platform() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = archive(&["Havoc (PC)/HavocV2.Galaxy/pallet.json"]);
+
+        let installed = extract_mod(bytes, dir.path(), None, TargetPlatform::ANDROID).unwrap();
+
+        assert_eq!(installed.folders, vec![OsString::from("HavocV2.Galaxy")]);
+        assert!(dir
+            .path()
+            .join("HavocV2.Galaxy")
+            .join("pallet.json")
+            .exists());
+    }
+
     /// A code mod is loaded by MelonLoader from beside the game, so it has to be
     /// laid out there rather than in the folder Bonelab reads pallets from.
     #[test]
@@ -747,7 +921,13 @@ mod tests {
             "Lakatrazz-Fusion-1.14.2/Mods/LabFusion.dll",
         ]);
 
-        let installed = extract_mod(bytes, mods.path(), Some(game.path())).unwrap();
+        let installed = extract_mod(
+            bytes,
+            mods.path(),
+            Some(game.path()),
+            TargetPlatform::WINDOWS,
+        )
+        .unwrap();
 
         assert!(
             installed.folders.is_empty(),
@@ -776,7 +956,13 @@ mod tests {
         let game = tempfile::tempdir().unwrap();
         let bytes = archive(&["SomeCodeMod.dll"]);
 
-        let installed = extract_mod(bytes, mods.path(), Some(game.path())).unwrap();
+        let installed = extract_mod(
+            bytes,
+            mods.path(),
+            Some(game.path()),
+            TargetPlatform::WINDOWS,
+        )
+        .unwrap();
 
         assert_eq!(
             installed.game_files,
@@ -790,8 +976,13 @@ mod tests {
     #[test]
     fn a_code_mod_with_nowhere_to_go_says_so() {
         let mods = tempfile::tempdir().unwrap();
-        let err = extract_mod(archive(&["Whatever/Mods/Thing.dll"]), mods.path(), None)
-            .expect_err("a code mod was installed with no game directory set");
+        let err = extract_mod(
+            archive(&["Whatever/Mods/Thing.dll"]),
+            mods.path(),
+            None,
+            TargetPlatform::WINDOWS,
+        )
+        .expect_err("a code mod was installed with no game directory set");
 
         assert!(
             format!("{err:#}").contains("BMM_GAME_DIR"),
@@ -809,7 +1000,9 @@ mod tests {
             "__MACOSX/Author.ModName/._pallet.json",
         ]);
 
-        let folders = extract_mod(bytes, dir.path(), None).unwrap().folders;
+        let folders = extract_mod(bytes, dir.path(), None, TargetPlatform::WINDOWS)
+            .unwrap()
+            .folders;
 
         assert_eq!(folders, vec![OsString::from("Author.ModName")]);
     }
@@ -819,7 +1012,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let bytes = archive(&["pallet.json"]);
 
-        assert!(extract_mod(bytes, dir.path(), None).is_err());
+        assert!(extract_mod(bytes, dir.path(), None, TargetPlatform::WINDOWS).is_err());
         assert!(!dir.path().join("pallet.json").exists());
     }
 
