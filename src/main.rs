@@ -119,8 +119,16 @@ async fn try_main() -> Result<()> {
 
     let target_platform = app_data.platform()?.target_platform();
     let mods_dir = app_data.mods_dir_path()?;
+    // Only code mods need this, and it cannot be worked out, so most runs will
+    // not have it. Those mods say so rather than installing somewhere useless.
+    let game_dir = app_data::game_dir_path();
 
     debug!("mods dir is \"{}\"", mods_dir.display());
+
+    match &game_dir {
+        Some(path) => debug!("game dir is \"{}\"", path.display()),
+        None => debug!("no game dir set, code mods will be reported rather than installed"),
+    }
 
     // Signing in may have just stored a token, and the copy read above predates
     // that. Without picking it up again, the writes further down would put the
@@ -162,7 +170,7 @@ async fn try_main() -> Result<()> {
             installed_mod.folders.len(),
         );
 
-        remove_installed_mod(&mods_dir, &installed_mod).await?;
+        remove_installed_mod(&mods_dir, game_dir.as_deref(), &installed_mod).await?;
         app_data.installed_mods.remove(&installed_mod_id);
     }
 
@@ -196,6 +204,7 @@ async fn try_main() -> Result<()> {
             Arc::clone(&client),
             target_platform,
             mods_dir.clone(),
+            game_dir.clone(),
             installed_mod,
         ));
         debug!("spawned task");

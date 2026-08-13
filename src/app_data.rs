@@ -25,6 +25,23 @@ const MODS_DIR_VAR: &str = "BMM_MODS_DIR";
 /// to revisit it.
 const PLATFORM_VAR: &str = "BMM_PLATFORM";
 
+/// Where Bonelab itself is installed.
+const GAME_DIR_VAR: &str = "BMM_GAME_DIR";
+
+/// The game's own directory, if it has been pointed out.
+///
+/// Only code mods need it. Bonelab reads pallets from a directory under the
+/// user profile, which can be worked out, but MelonLoader loads code mods from
+/// beside the executable, and there is no dependable way to find that: the game
+/// ships on Steam and on the Oculus store, and can be moved anywhere.
+pub(crate) fn game_dir_path() -> Option<PathBuf> {
+    let path = env::var_os(GAME_DIR_VAR)?;
+
+    debug!("using game dir path from {GAME_DIR_VAR}");
+
+    Some(PathBuf::from(path))
+}
+
 #[derive(Serialize, Deserialize, Default)]
 pub(crate) struct AppData {
     /// The mod.io token, encrypted for the current Windows user.
@@ -113,46 +130,74 @@ pub(crate) struct InstalledMod {
     /// archive, each with its own pallet, which Bonelab loads independently. All
     /// of them have to be recorded, or unsubscribing would leave the rest behind.
     pub(crate) folders: Vec<OsString>,
+    /// Files this mod put in the game's own directory, relative to it.
+    ///
+    /// Empty for ordinary mods. Code mods are loaded by MelonLoader out of the
+    /// game directory rather than by Bonelab out of its Mods directory, so they
+    /// land somewhere else entirely and need recording separately.
+    pub(crate) game_files: Vec<OsString>,
 }
 
-/// The shape written before packs were supported, when a mod was one folder.
+/// An older on disk shape, kept so an existing install carries over rather than
+/// being reset, which would cost the record of every installed mod and download
+/// all of them again.
 ///
-/// Kept so an existing install carries over rather than being reset, which would
-/// cost the record of every installed mod and download all of them again.
+/// Generic over the record so each new shape adds one small struct rather than
+/// another copy of the whole thing.
 #[derive(Deserialize)]
-struct LegacyAppData {
+struct OlderAppData<M> {
     #[cfg(target_os = "windows")]
     modio_token: Option<Vec<u8>>,
     #[cfg(target_os = "windows")]
     platform: Option<BonelabPlatform>,
-    installed_mods: HashMap<u64, LegacyInstalledMod>,
+    installed_mods: HashMap<u64, M>,
 }
 
+/// Before code mods could be installed into the game directory.
 #[derive(Deserialize)]
-struct LegacyInstalledMod {
+struct ModBeforeCodeMods {
+    date_updated: u64,
+    folders: Vec<OsString>,
+}
+
+/// Before packs, when a mod was a single folder.
+#[derive(Deserialize)]
+struct ModBeforePacks {
     date_updated: u64,
     folder: OsString,
 }
 
-impl From<LegacyAppData> for AppData {
-    fn from(legacy: LegacyAppData) -> Self {
+impl From<ModBeforeCodeMods> for InstalledMod {
+    fn from(older: ModBeforeCodeMods) -> Self {
+        Self {
+            date_updated: older.date_updated,
+            folders: older.folders,
+            game_files: Vec::new(),
+        }
+    }
+}
+
+impl From<ModBeforePacks> for InstalledMod {
+    fn from(older: ModBeforePacks) -> Self {
+        Self {
+            date_updated: older.date_updated,
+            folders: vec![older.folder],
+            game_files: Vec::new(),
+        }
+    }
+}
+
+impl<M: Into<InstalledMod>> From<OlderAppData<M>> for AppData {
+    fn from(older: OlderAppData<M>) -> Self {
         Self {
             #[cfg(target_os = "windows")]
-            modio_token: legacy.modio_token,
+            modio_token: older.modio_token,
             #[cfg(target_os = "windows")]
-            platform: legacy.platform,
-            installed_mods: legacy
+            platform: older.platform,
+            installed_mods: older
                 .installed_mods
                 .into_iter()
-                .map(|(id, installed_mod)| {
-                    (
-                        id,
-                        InstalledMod {
-                            date_updated: installed_mod.date_updated,
-                            folders: vec![installed_mod.folder],
-                        },
-                    )
-                })
+                .map(|(id, installed_mod)| (id, installed_mod.into()))
                 .collect(),
         }
     }
@@ -240,6 +285,14 @@ impl AppData {
         ))
     }
 
+    /// Writes app data that has just been brought forward from an older shape,
+    /// so the conversion only happens once.
+    async fn converted(app_data: Self) -> Result<Self> {
+        app_data.write().await?;
+
+        Ok(app_data)
+    }
+
     async fn write_default() -> Result<Self> {
         let default = Self::default();
 
@@ -264,17 +317,20 @@ impl AppData {
             return Ok(app_data);
         }
 
-        // A file from before packs were supported reads as the older shape
-        // instead. Convert it rather than starting over, which would mean
-        // downloading every installed mod again.
-        if let Ok(legacy) = postcard::from_bytes::<LegacyAppData>(&bytes) {
+        // A file from an older build reads as one of the shapes that came
+        // before. Convert it rather than starting over, which would mean
+        // downloading every installed mod again. Newest first, since an older
+        // shape is a prefix of a newer one and would otherwise match early.
+        if let Ok(older) = postcard::from_bytes::<OlderAppData<ModBeforeCodeMods>>(&bytes) {
+            debug!("converting app data from the layout used before code mods");
+
+            return Self::converted(older.into()).await;
+        }
+
+        if let Ok(older) = postcard::from_bytes::<OlderAppData<ModBeforePacks>>(&bytes) {
             debug!("converting app data from the layout used before mod packs");
 
-            let app_data = Self::from(legacy);
-
-            app_data.write().await?;
-
-            return Ok(app_data);
+            return Self::converted(older.into()).await;
         }
 
         // Anything else is corrupt or from a layout nothing here knows. Not
@@ -322,6 +378,73 @@ mod tests {
         folder: OsString,
     }
 
+    /// The shape written between packs landing and code mods landing, which is
+    /// what an install updated earlier today has on disk.
+    #[derive(Serialize)]
+    struct PackEraAppData {
+        modio_token: Option<Vec<u8>>,
+        platform: Option<BonelabPlatform>,
+        installed_mods: HashMap<u64, PackEraInstalledMod>,
+    }
+
+    #[derive(Serialize)]
+    struct PackEraInstalledMod {
+        date_updated: u64,
+        folders: Vec<OsString>,
+    }
+
+    fn app_data_from_the_pack_era() -> Vec<u8> {
+        let mut installed_mods = HashMap::new();
+
+        installed_mods.insert(
+            A_MOD,
+            PackEraInstalledMod {
+                date_updated: 1699999999,
+                folders: vec![
+                    OsString::from("BamBaeYoh.ZombieWeapons"),
+                    OsString::from("Pulvox.Dempsy"),
+                ],
+            },
+        );
+
+        postcard::to_stdvec(&PackEraAppData {
+            modio_token: Some(b" dpapi1 ciphertext".to_vec()),
+            platform: Some(BonelabPlatform::Windows),
+            installed_mods,
+        })
+        .unwrap()
+    }
+
+    /// The conversion chain has to try newest first. An older shape is a prefix
+    /// of a newer one, so checking in the other order could match the wrong one
+    /// and quietly drop whatever the newer shape added.
+    #[test]
+    fn app_data_from_before_code_mods_converts_and_keeps_its_packs() {
+        let bytes = app_data_from_the_pack_era();
+
+        assert!(
+            postcard::from_bytes::<AppData>(&bytes).is_err(),
+            "the pack era layout parsed as the current one, so the conversion              would be skipped and `game_files` filled with whatever followed",
+        );
+
+        let converted = AppData::from(
+            postcard::from_bytes::<OlderAppData<ModBeforeCodeMods>>(&bytes)
+                .expect("app data from the pack era can no longer be read"),
+        );
+        let installed = &converted.installed_mods[&A_MOD];
+
+        assert_eq!(
+            installed.folders,
+            vec![
+                OsString::from("BamBaeYoh.ZombieWeapons"),
+                OsString::from("Pulvox.Dempsy"),
+            ],
+            "a pack lost its folders on the way across",
+        );
+        assert!(installed.game_files.is_empty());
+        assert_eq!(converted.platform, Some(BonelabPlatform::Windows));
+    }
+
     fn app_data_from_an_older_build() -> Vec<u8> {
         let mut installed_mods = HashMap::new();
 
@@ -357,7 +480,7 @@ mod tests {
         );
 
         let converted = AppData::from(
-            postcard::from_bytes::<LegacyAppData>(&bytes)
+            postcard::from_bytes::<OlderAppData<ModBeforePacks>>(&bytes)
                 .expect("app data from an older build can no longer be read at all"),
         );
 

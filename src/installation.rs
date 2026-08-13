@@ -195,13 +195,22 @@ impl ModInstallation {
 /// hand, and there is nothing left to do either way.
 pub(crate) async fn remove_installed_mod(
     mods_dir: &Path,
+    game_dir: Option<&Path>,
     installed_mod: &InstalledMod,
 ) -> Result<()> {
     // A pack put down several folders and all of them have to go, or
-    // unsubscribing would leave most of it behind.
-    for folder in &installed_mod.folders {
-        let path = mods_dir.join(folder);
+    // unsubscribing would leave most of it behind. A code mod put its files
+    // beside the game instead, and leaving those would keep it loading.
+    let in_mods_dir = installed_mod
+        .folders
+        .iter()
+        .map(|folder| mods_dir.join(folder));
+    let beside_the_game = installed_mod
+        .game_files
+        .iter()
+        .filter_map(|file| game_dir.map(|dir| dir.join(file)));
 
+    for path in in_mods_dir.chain(beside_the_game) {
         debug!("removing \"{}\"", path.display());
 
         let metadata = match symlink_metadata(&path).await {
@@ -282,6 +291,7 @@ pub(crate) async fn install_mod(
     client: Arc<Client>,
     target_platform: TargetPlatform,
     mods_dir: PathBuf,
+    game_dir: Option<PathBuf>,
     installed_mod: Option<InstalledMod>,
 ) -> Result<ModInstallationOutcome> {
     let mut mod_installation = ModInstallation::new(r#mod.name.clone(), progress_bar)?;
@@ -292,6 +302,7 @@ pub(crate) async fn install_mod(
         client,
         target_platform,
         mods_dir,
+        game_dir,
         installed_mod,
     )
     .await
@@ -325,6 +336,7 @@ async fn _install_mod(
     client: Arc<Client>,
     target_platform: TargetPlatform,
     mods_dir: PathBuf,
+    game_dir: Option<PathBuf>,
     installed_mod: Option<InstalledMod>,
 ) -> Result<ModInstallationOutcome> {
     let mod_id = r#mod.id;
@@ -340,10 +352,21 @@ async fn _install_mod(
             // since been deleted by hand needs laying down again however recent
             // the record claims it is. A pack counts as present only if all of
             // its folders are, since a half deleted pack is still incomplete.
-            let mut present = !installed_mod.folders.is_empty();
+            let laid_down: Vec<_> = installed_mod
+                .folders
+                .iter()
+                .map(|folder| mods_dir.join(folder))
+                .chain(
+                    installed_mod
+                        .game_files
+                        .iter()
+                        .filter_map(|file| game_dir.as_ref().map(|dir| dir.join(file))),
+                )
+                .collect();
+            let mut present = !laid_down.is_empty();
 
-            for folder in &installed_mod.folders {
-                if !try_exists(mods_dir.join(folder)).await? {
+            for path in laid_down {
+                if !try_exists(path).await? {
                     present = false;
 
                     break;
@@ -400,16 +423,22 @@ async fn _install_mod(
     // Clear the old copy first so files dropped by the new version don't
     // survive the update.
     if let Some(installed_mod) = &installed_mod {
-        remove_installed_mod(&mods_dir, installed_mod).await?;
+        remove_installed_mod(&mods_dir, game_dir.as_deref(), installed_mod).await?;
     }
 
-    let folders = spawn_blocking(move || extract_mod(bytes, &mods_dir)).await??;
+    let installed =
+        spawn_blocking(move || extract_mod(bytes, &mods_dir, game_dir.as_deref())).await??;
 
-    debug!("extracted mod file into {} folder(s)", folders.len());
+    debug!(
+        "extracted {} folder(s) and {} file(s) beside the game",
+        installed.folders.len(),
+        installed.game_files.len(),
+    );
 
     let installed_mod = InstalledMod {
         date_updated,
-        folders,
+        folders: installed.folders,
+        game_files: installed.game_files,
     };
 
     Ok(if updating {
@@ -427,13 +456,130 @@ async fn _install_mod(
 /// all of them get installed. What it may not do is leave files loose at the
 /// root, which would scatter them across the Mods folder; that is checked before
 /// extracting anything, so a bad archive leaves the Mods folder untouched.
-fn extract_mod(bytes: Vec<u8>, mods_dir: &Path) -> Result<Vec<OsString>> {
+/// What a mod put on disk, so that removing it later can undo exactly that.
+#[derive(Default, Debug)]
+pub(crate) struct Installed {
+    pub(crate) folders: Vec<OsString>,
+    pub(crate) game_files: Vec<OsString>,
+}
+
+/// The directories a code mod archive mirrors into the game directory.
+///
+/// MelonLoader reads assemblies from `Mods` and `Plugins`, and mods keep their
+/// settings in `UserData`. Anything else in the archive, a readme or an icon or
+/// a Thunderstore manifest, is packaging rather than the mod.
+const GAME_DIRS: [&str; 3] = ["Mods", "Plugins", "UserData"];
+
+fn extract_mod(bytes: Vec<u8>, mods_dir: &Path, game_dir: Option<&Path>) -> Result<Installed> {
     let mut archive = ZipArchive::new(Cursor::new(bytes))?;
+
+    // Bonelab loads a mod from a folder holding a pallet. Anything with no
+    // pallet anywhere in it, but with an assembly, is a code mod instead, which
+    // Bonelab never looks at and MelonLoader loads from the game directory.
+    if !has_pallet(&mut archive)? {
+        return extract_code_mod(&mut archive, game_dir);
+    }
+
     let folders = root_folders(&mut archive)?;
 
     archive.extract(mods_dir)?;
 
-    Ok(folders)
+    Ok(Installed {
+        folders,
+        game_files: Vec::new(),
+    })
+}
+
+fn has_pallet(archive: &mut ZipArchive<Cursor<Vec<u8>>>) -> Result<bool> {
+    for index in 0..archive.len() {
+        let file = archive.by_index(index)?;
+        let Some(path) = file.enclosed_name() else {
+            continue;
+        };
+        let Some(name) = path.file_name().map(|name| name.to_string_lossy()) else {
+            continue;
+        };
+
+        // Mods in the wild use either a plain `pallet.json` or one named after
+        // the mod, like `Aubies12.Bean.pallet.json`.
+        if name == "pallet.json" || name.ends_with(".pallet.json") {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+/// Lays a code mod out beside the game the way MelonLoader expects to find it.
+///
+/// Archives come both flat and wrapped in a folder named after the release, so
+/// placement keys off where `Mods`, `Plugins` or `UserData` appears in each
+/// path rather than off the depth it appears at. An assembly with none of those
+/// above it is treated as belonging in `Mods`, which is where a bare `.dll`
+/// download is meant to go.
+fn extract_code_mod(
+    archive: &mut ZipArchive<Cursor<Vec<u8>>>,
+    game_dir: Option<&Path>,
+) -> Result<Installed> {
+    let Some(game_dir) = game_dir else {
+        bail!(
+            "this is a code mod, which has to go beside the game rather than in the mods folder. \
+             Set BMM_GAME_DIR to the folder holding BONELAB_Steam_Windows64.exe to install it"
+        );
+    };
+
+    let mut installed = Installed::default();
+
+    for index in 0..archive.len() {
+        let mut file = archive.by_index(index)?;
+
+        if file.is_dir() {
+            continue;
+        }
+
+        let Some(path) = file.enclosed_name() else {
+            bail!("Mod file archive contains an unsafe path");
+        };
+        let Some(relative) = game_relative_path(&path) else {
+            debug!("skipping \"{}\", not part of the mod", path.display());
+
+            continue;
+        };
+        let destination = game_dir.join(&relative);
+
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        std::io::copy(&mut file, &mut std::fs::File::create(&destination)?)?;
+        debug!("wrote \"{}\"", destination.display());
+
+        installed.game_files.push(relative.into_os_string());
+    }
+
+    if installed.game_files.is_empty() {
+        bail!("Mod file archive has nothing in it that MelonLoader could load");
+    }
+
+    Ok(installed)
+}
+
+/// Where an archive entry belongs relative to the game directory, if anywhere.
+fn game_relative_path(path: &Path) -> Option<PathBuf> {
+    let components: Vec<_> = path.components().collect();
+
+    for (index, component) in components.iter().enumerate() {
+        if GAME_DIRS.contains(&component.as_os_str().to_string_lossy().as_ref()) {
+            return Some(components[index..].iter().collect());
+        }
+    }
+
+    // A loose assembly is what a mod published as a bare `.dll` looks like.
+    if path.extension().is_some_and(|extension| extension == "dll") {
+        return Some(Path::new("Mods").join(path.file_name()?));
+    }
+
+    None
 }
 
 /// The top level folders an archive will extract into.
@@ -542,7 +688,7 @@ mod tests {
             "Author.ModName/data/thing.bin",
         ]);
 
-        let folders = extract_mod(bytes, dir.path()).unwrap();
+        let folders = extract_mod(bytes, dir.path(), None).unwrap().folders;
 
         assert_eq!(folders, vec![OsString::from("Author.ModName")]);
         assert!(dir
@@ -567,7 +713,7 @@ mod tests {
             "Pulvox.Nikolai/pallet.json",
         ]);
 
-        let folders = extract_mod(bytes, dir.path()).unwrap();
+        let folders = extract_mod(bytes, dir.path(), None).unwrap().folders;
 
         assert_eq!(
             folders,
@@ -586,6 +732,73 @@ mod tests {
         }
     }
 
+    /// A code mod is loaded by MelonLoader from beside the game, so it has to be
+    /// laid out there rather than in the folder Bonelab reads pallets from.
+    #[test]
+    fn installs_a_code_mod_beside_the_game() {
+        let mods = tempfile::tempdir().unwrap();
+        let game = tempfile::tempdir().unwrap();
+        // The shape Fusion ships in: a wrapper folder, packaging files that are
+        // not the mod, and the assembly under `Mods`.
+        let bytes = archive(&[
+            "Lakatrazz-Fusion-1.14.2/manifest.json",
+            "Lakatrazz-Fusion-1.14.2/README.md",
+            "Lakatrazz-Fusion-1.14.2/icon.png",
+            "Lakatrazz-Fusion-1.14.2/Mods/LabFusion.dll",
+        ]);
+
+        let installed = extract_mod(bytes, mods.path(), Some(game.path())).unwrap();
+
+        assert!(
+            installed.folders.is_empty(),
+            "a code mod should put nothing in the pallets folder",
+        );
+        assert_eq!(
+            installed.game_files,
+            vec![Path::new("Mods").join("LabFusion.dll").into_os_string()],
+        );
+        assert!(game.path().join("Mods").join("LabFusion.dll").exists());
+        assert!(
+            !mods.path().join("Lakatrazz-Fusion-1.14.2").exists(),
+            "the packaging folder was copied into the pallets folder",
+        );
+        assert!(
+            !game.path().join("README.md").exists(),
+            "packaging files should not be strewn beside the game",
+        );
+    }
+
+    /// A mod published as a bare assembly is what MelonLoader's own docs
+    /// describe, and belongs in `Mods` even though the archive says nothing.
+    #[test]
+    fn a_loose_assembly_goes_into_the_games_mods_folder() {
+        let mods = tempfile::tempdir().unwrap();
+        let game = tempfile::tempdir().unwrap();
+        let bytes = archive(&["SomeCodeMod.dll"]);
+
+        let installed = extract_mod(bytes, mods.path(), Some(game.path())).unwrap();
+
+        assert_eq!(
+            installed.game_files,
+            vec![Path::new("Mods").join("SomeCodeMod.dll").into_os_string()],
+        );
+        assert!(game.path().join("Mods").join("SomeCodeMod.dll").exists());
+    }
+
+    /// Without somewhere to put it, saying so beats installing it where nothing
+    /// will ever load it, which is what used to happen.
+    #[test]
+    fn a_code_mod_with_nowhere_to_go_says_so() {
+        let mods = tempfile::tempdir().unwrap();
+        let err = extract_mod(archive(&["Whatever/Mods/Thing.dll"]), mods.path(), None)
+            .expect_err("a code mod was installed with no game directory set");
+
+        assert!(
+            format!("{err:#}").contains("BMM_GAME_DIR"),
+            "the error does not say how to fix it: {err:#}",
+        );
+    }
+
     /// Junk a packaging tool left behind is not a mod, and counting it as one
     /// would leave an empty folder in the Mods directory forever.
     #[test]
@@ -596,7 +809,7 @@ mod tests {
             "__MACOSX/Author.ModName/._pallet.json",
         ]);
 
-        let folders = extract_mod(bytes, dir.path()).unwrap();
+        let folders = extract_mod(bytes, dir.path(), None).unwrap().folders;
 
         assert_eq!(folders, vec![OsString::from("Author.ModName")]);
     }
@@ -606,7 +819,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let bytes = archive(&["pallet.json"]);
 
-        assert!(extract_mod(bytes, dir.path()).is_err());
+        assert!(extract_mod(bytes, dir.path(), None).is_err());
         assert!(!dir.path().join("pallet.json").exists());
     }
 
@@ -685,6 +898,7 @@ mod tests {
             Arc::clone(client),
             target_platform,
             mods_dir.to_path_buf(),
+            None,
             installed_mod,
         )
         .await
@@ -740,6 +954,7 @@ mod tests {
         let stale = InstalledMod {
             date_updated: installed_mod.date_updated - 1,
             folders: installed_mod.folders.clone(),
+            game_files: Vec::new(),
         };
         let ModInstallationOutcome::Updated(_, updated) =
             install_live_mod(&client, TargetPlatform::WINDOWS, dir.path(), Some(stale)).await

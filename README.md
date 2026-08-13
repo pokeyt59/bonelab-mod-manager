@@ -151,6 +151,30 @@ your headset.
 I know, it isn't ideal having to move the mods from this folder to your headset,
 but it's on the roadmap for the mod manager to do that for you, it will in the future!
 
+## Code Mods
+
+Most Bonelab mods are content: a folder holding a pallet, which the game loads
+from its own Mods directory. A few are code mods, assemblies that MelonLoader
+loads from **beside the game** instead. Fusion, the multiplayer mod, is one.
+
+Those cannot be installed without being told where the game is, because there is
+no dependable way to find it: Bonelab ships on two stores and can be moved
+anywhere. Set `BMM_GAME_DIR` to the folder holding `BONELAB_Steam_Windows64.exe`
+and they will be installed alongside your other mods:
+
+```sh
+BMM_GAME_DIR="C:\Program Files (x86)\Steam\steamapps\common\BONELAB"
+```
+
+Without it, a code mod is reported as needing that variable rather than being
+put somewhere nothing will ever load it. Whatever a code mod places beside the
+game is recorded, so unsubscribing removes it again rather than leaving it
+loading forever.
+
+MelonLoader itself is not installed by this program. Get it from
+[MelonLoader](https://github.com/LavaGang/MelonLoader) first, or code mods will
+sit there unread.
+
 ## Configuration
 
 Bonelab Mod Manager is configured through environment variables.
@@ -160,6 +184,7 @@ Bonelab Mod Manager is configured through environment variables.
 | `BMM_CONCURRENT_DOWNLOADS` | How many mods to install at a time. Defaults to 4, since hardware differs drastically. |
 | `BMM_MODS_DIR` | Installs mods here instead of the built-in path. Use this if you run Bonelab through Proton on Linux or the Steam Deck, where the game's `LocalLow` directory lives inside a Wine prefix. |
 | `BMM_PLATFORM` | `windows` or `quest`. Overrides the platform you picked on first run, which is otherwise saved for good. |
+| `BMM_GAME_DIR` | The folder holding `BONELAB_Steam_Windows64.exe`. Only code mods need it, and they are reported rather than installed without it. See Code Mods above. |
 | `BMM_MODIO_TOKEN` | Signs in with this mod.io token instead of prompting. The token is used as-is and is not saved. |
 | `MODIO_API_KEY` | The mod.io API key to run against. Only needed for builds that had no key compiled in. |
 
